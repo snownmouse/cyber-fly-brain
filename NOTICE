@@ -1,0 +1,37 @@
+Cyber-Fly Brain
+Copyright 2026 snownmouse
+
+This repository contains an orchestration layer for a connectome-inspired fruit-fly
+brain. It links against, loads, or documents the following third-party work.
+
+--------------------------------------------------------------------------------
+flywire-fly-lab
+  https://github.com/suifei/flywire-fly-lab
+  License: Apache License, Version 2.0
+
+  NOT VENDORED HERE. brain_b/b_loop/stage1_loop.js loads it at runtime:
+
+      const REPO = process.env.FLYLAB || '/root/flywire-fly-lab';
+      const { ConnectomeBrain } = require(path.join(REPO, 'dodge/brain.js'));
+
+  You must obtain that project separately. The datasets under its results/
+  directory are published under CC BY-NC 4.0 (non-commercial); they are not
+  redistributed here and no rights to them are granted by this repository.
+
+--------------------------------------------------------------------------------
+ESP-Mosaico Vibe
+  https://github.com/esp-mosaico/esp-mosaico-vibe
+  Board-side framework only. The board firmware lives in the sibling repository
+  https://github.com/snownmouse/cyber-fly and is not part of this repository.
+
+--------------------------------------------------------------------------------
+Scientific basis (no code taken)
+
+  - FlyWire consortium, "Neuronal wiring diagram of an adult brain",
+    Nature 634 (2024).
+  - Shiu, Sterne et al., "A Drosophila computational brain model reveals
+    sensorimotor processing", Nature 634:210-219 (2024).
+
+  This project is a functional realisation of the same principle
+  (sensory input -> connectome computation -> motor output). It is not a
+  per-neuron simulation of all ~140,000 cells.
