@@ -275,6 +275,62 @@
     </table>
     <div class="note">⚠️ 之前 8080 看不到「听觉/梳理/侧向/起始/门限/上行特征」的根因：fly_watch2 的诊断 HTTP 原本想绑 8080，被看板占用导致绑定失败——算好的字段无处可出。已将诊断口改到 33340，看板 DIAG_API 默认指向它，前端合并 lastDiag 字段，问题消除。</div>
   </div>
+
+  <!-- ⑨ 纯增量：感觉融合层。①~⑧ 的图与表格一个字未动。 -->
+  <div class="card" style="background:#f5f3ff;border-color:#ddd6fe">
+    <h2>⑨ 感觉融合（本次新增 · 面包板 6 路）<span class="tag" style="background:#7c3aed">2 Hz 慢车道</span></h2>
+    <p style="font-size:14px;margin:0 0 12px">
+      原来每 50 ms 一通「电话」只报听觉与姿态（<b>68 B MPRB</b>）。六双眼睛若一起挤进来，
+      温湿度读一次 110 ms、光照 180 ms，比通话间隔还长，大脑也会被六股连续数字淹掉。
+      所以<b>不扩包、不加速</b>，另开一条 <b>40 B MPRS / 2 Hz 慢车道</b>，让 ESP32 先当「脊髓」：
+    </p>
+    <table>
+      <thead><tr><th>通路</th><th>带什么</th><th>谁处理</th><th>落到大脑</th></tr></thead>
+      <tbody>
+        <tr><td><b>A 直连</b></td><td>温 / 湿 / 光 / VOC / 测距，压成整数原样</td><td>不做解释，只量化 + 有效位</td><td>让连接组自己学关联（默认折成全局唤醒）</td></tr>
+        <tr><td><b>B 脊髓</b></td><td>摇杆、突然靠近这类要快的</td><td>板端降维成 8 方向 / 事件码 / 显著度</td><td>收「结论」而不是六条曲线</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:13px;color:#5b21b6;margin:12px 0 0">
+      <b>中转层 = 降维</b>：6 路连续量 → 7 个定点整数 + 1 个事件码 + 1 个显著度。
+      云端再做 2.5 秒过期作废（板子掉线不能拿旧温度骗大脑）和 <code>FLY_SENSE_GAIN</code>（默认 0.18，设 0 一键退回纯原链路）。
+    </p>
+    <div class="note" style="background:#fff;border-color:#c4b5fd;color:#5b21b6">
+      <b>三条不变量（改动时别破）：</b>① 68 B / 20 Hz 一个字节不动（relay 按长度分发，CRC 死钉在偏移 64）；
+      ② 40 B 帧绝不进 <code>stepFrame</code>、绝不回 MPRC，否则多出 2 Hz 下行打乱闭环；
+      ③ 40 B 不转发给 33336 诊断（<code>fly_watch2</code> 只认 68 B，会记成坏帧）。
+    </div>
+
+    <h2 style="margin-top:18px">页面新增的属性 <span class="tag" style="background:#7c3aed">fly_dashboard :8080</span></h2>
+    <p style="font-size:13.5px;margin:0 0 8px">
+      看板侧栏新增「<b>感官层</b>」面板：6 路实时值、有效位、脊髓事件、显著度条、帧/坏帧、数据年龄，
+      以及 <b>gain 滑块</b>（<code>FLY_SENSE_TUNE=1</code> 时可在线调，只改内存变量、不重启大脑）。
+      面板复用主看板已有的 <code>/api</code> 数据，<b>不多发一次请求</b>；<code>--api</code> 关闭时优雅降级为一行提示。
+      实现放在独立的 <code>sense_panel.js</code>，服务端拼进同一个 &lt;script&gt;，原有页面代码一行未删。
+    </p>
+
+    <h2 style="margin-top:18px">部署形态与资源预算 <span class="tag" style="background:#0f766e">多项目共存</span></h2>
+    <table>
+      <thead><tr><th>档位</th><th>跑在哪</th><th>进程</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><b>本机档（推荐调试）</b></td><td>开 2.4 GHz 电脑热点的这台电脑</td><td>2（relay + stage1）</td><td><b>完全不占云服务器</b>；<code>start_local.ps1</code></td></tr>
+        <tr><td>本机 + 看板</td><td>同上</td><td>4</td><td>加 <code>-WithDashboard</code>：诊断 33336 + 看板 8080 + 影子脑</td></tr>
+        <tr><td><b>云端共存档</b></td><td>那台还挂 2~3 个项目的 Lighthouse</td><td>2（默认轻量）</td><td><code>start_local.sh</code>：<code>LITE=1</code> 关 <code>--api</code> / 影子脑 / 诊断，<code>--quiet</code> 减日志</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:13px;color:#5b6675;margin:10px 0 0">
+      真正吃 CPU 的是原本就有的 20 Hz 主脑步；<b>影子脑</b>（每 250 ms 一次完整脑步，约 18 ms / 单核 7%）只在开 <code>--api</code> 时存在，
+      <b>感官层只有 2 Hz 解码 + 存，几乎零开销</b>。整套端口可用 <code>OFFSET=1000</code> / <code>-Offset 1000</code> 整体平移，跟同机别的项目零冲突；
+      停止脚本只按 PID 文件 kill，不会误杀其它项目。看板轮询可用 <code>FLY_DASH_POLL_MS=1000</code> 从 300 ms 降频。
+    </p>
+    <div class="note" style="background:#eff6ff;border-color:#93c5fd;color:#1e40af">
+      <b>网络（本地用热点、公开仓库保持占位符）：</b>真实 SSID / 密码 / 大脑 IP 放在仓外的
+      <code>D:\ESP\local\cyber_fly_net.conf</code>，用 <code>tools/set_local_net.py</code> 只写被 gitignore 的
+      <code>build/sdkconfig</code>，推 GitHub 前不用手工改回。Windows 移动热点要设 2.4 GHz；大脑若跑在同一台电脑，
+      <code>HOST</code> 填它在<b>热点网段</b>的地址（<code>ipconfig</code> 查「本地连接* N」，常为 <code>192.168.137.1</code>），不是普通 Wi-Fi 地址。
+      连接组 <code>subcircuit_v4.json</code> 是 CC BY-NC 4.0 的运行时依赖，本地跑需自备一份、<b>不要提交</b>。
+    </div>
+  </div>
 </div>
 </body>
 </html>

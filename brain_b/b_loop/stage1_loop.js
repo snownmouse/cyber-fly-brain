@@ -138,6 +138,29 @@ const WATCH = { window: 8, inputEps: 0.20, boost: 2.0, hold: 16 };
 
 // ---------------------------------------------------------------- 4. 特征 → 驱动强度
 const CFG = { floorDb: -60, refDb: -20, rMaxHz: 300, touchRestG: 1.0, touchSpanG: 0.8, latSpanG: 0.6, turnDeadband: 0.25 };
+
+// ---------------------------------------------------------------- 3b. 转向：由脑给，不由 IMU 直写
+// ★ 2026-11-11 实测（服务器离线扫种子，脚本见 brain_b/STEER-BY-BRAIN.md）：
+//   v4 子回路里唯一【双向对称】的方向通路是视觉层 —— LC16_left/right 差动驱动时，
+//   DNa02_left − DNa02_right 随差动单调变化（base 150 Hz：−1→+55、0→+12、+1→−34 Hz），
+//   LC4 同理驱动 DNa01（−1→+41、+1→−39）。而触觉只有左向通路（TOUCH_right 给到 900 Hz
+//   仍打不开 DNa02_R），所以"撞哪边就往另一边转"没法用触觉实现，只能用视觉。
+//   ⇒ 转向 = LC16 左右差动 → DNa02/DNa01 左右差 → turn。IMU 的 lat 只作为
+//     "没有视觉时的兜底反射"（黑暗里仍能躲），不再直接等于 turn。
+//   侧化信号（谁更亮）优先级：摇杆 joyX（人在环中）> IMU lat（当作来自那一侧的推力）。
+//   真正的左右视场要等相机子板；在此之前这一路是【明确标注的近似】，见 /api 的 steer.src。
+const STEER = {
+  mode: process.env.FLY_STEER_SRC || 'brain',          // brain | reflex（reflex = 改动前行为）
+  baseMin: +(process.env.FLY_VIS_MIN || 30),           // 视觉方向通道的最低驱动（Hz）
+  baseMax: +(process.env.FLY_VIS_MAX || 180),          // 最亮时（≈2000 lx 以上）
+  scale: +(process.env.FLY_TURN_SCALE || 45),          // 左右差多少 Hz 算满舵
+  adaptMs: +(process.env.FLY_STEER_ADAPT_MS || 250),  // 基线回中时间常数（松手后 0.25 s 归正；有指令时冻结）
+  deadband: +(process.env.FLY_STEER_DEAD || 0.12),     // 小于它算直行，防抖
+};
+// 视觉方向端口（启动时探测；子回路里没有 LC16 就整条脑转向作废、退回反射）
+let VIS_PORT = null;
+// 视觉方向通道的当前状态：base = 总驱动（由照度给），lat = 左亮程度（+1 全左 / −1 全右）
+const VIS = { base: 0, lat: 0, src: 'none', at: 0 };
 const clamp01 = (x) => x < 0 ? 0 : (x > 1 ? 1 : x);
 const clamp = (x, a, b) => x < a ? a : (x > b ? b : x);
 const psumDb = (list) => 10 * Math.log10(list.reduce((a, d) => a + Math.pow(10, d / 10), 0));
@@ -199,6 +222,324 @@ function decodeFeature68(buf) {
     accel: [dv.getFloat32(40, true), dv.getFloat32(44, true), dv.getFloat32(48, true)],
   };
 }
+// ---------------------------------------------------- 2b. 40 B MPRS 感官帧（2 Hz 慢车道）
+// 与板端 projects/cyber_fly/main/fly_link.h 的布局逐字节一致。
+// 与 68 B 帧完全独立：relay 只把它转给大脑；本文件收到后【只解码、只存】，
+// 绝不 stepFrame、绝不回 MPRC，否则会多出 2 Hz 的下行帧打乱 20 Hz 闭环。
+const MAGIC_SENSE = 0x5352504D;   // "MPRS"
+const SENSE_LEN = 40;
+const SENSE_VALID = { TEMPRH: 1, LUX: 2, VOC: 4, DIST: 8, JOY: 16 };
+// 由独立实现（zlib.crc32 + struct）算出的黄金帧，与 C 端 verify_mprs.c 共用。
+const GOLDEN_SENSE_HEX = '4d5052530105280009000000090300005a0a69144001a401b40080fd70031f0002600000972ca550';
+
+function decodeSense40(buf) {
+  if (buf.length !== SENSE_LEN) throw new Error('感官帧长度 ≠ 40');
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  if (dv.getUint32(0, true) !== MAGIC_SENSE) throw new Error('magic != MPRS');
+  if (dv.getUint8(4) !== 1) throw new Error('version != 1');
+  if (dv.getUint16(6, true) !== SENSE_LEN) throw new Error('payload_len != 40');
+  if (crc32(buf, 36) !== dv.getUint32(36, true)) throw new Error('CRC 不符');
+  return {
+    seq: dv.getUint32(8, true), sendTsUs: dv.getUint32(12, true),
+    tempC: dv.getInt16(16, true) / 100,
+    rh: dv.getUint16(18, true) / 100,
+    lux: dv.getUint16(20, true),
+    voc: dv.getUint16(22, true),
+    distMm: dv.getUint16(24, true),
+    joyX: dv.getInt16(26, true), joyY: dv.getInt16(28, true),
+    valid: dv.getUint16(30, true),
+    event: dv.getUint8(32), arousal: dv.getUint8(33),
+    spare: dv.getUint16(34, true),
+  };
+}
+
+// 仅自检 / 联测使用；生产环境里板端才是唯一的生产者。
+function encodeSense40(o) {
+  const b = Buffer.alloc(SENSE_LEN);
+  b.writeUInt32LE(MAGIC_SENSE, 0);
+  b.writeUInt8(1, 4); b.writeUInt8(5, 5); b.writeUInt16LE(SENSE_LEN, 6);
+  b.writeUInt32LE(o.seq >>> 0, 8); b.writeUInt32LE(o.sendTsUs >>> 0, 12);
+  b.writeInt16LE(Math.round(o.tempC * 100), 16);
+  b.writeUInt16LE(Math.round(o.rh * 100), 18);
+  b.writeUInt16LE(o.lux | 0, 20); b.writeUInt16LE(o.voc | 0, 22);
+  b.writeUInt16LE(o.distMm | 0, 24);
+  b.writeInt16LE(o.joyX | 0, 26); b.writeInt16LE(o.joyY | 0, 28);
+  b.writeUInt16LE(o.valid | 0, 30);
+  b.writeUInt8(o.event | 0, 32); b.writeUInt8(o.arousal | 0, 33);
+  b.writeUInt16LE(o.spare | 0, 34);
+  b.writeUInt32LE(crc32(b, 36), 36);
+  return b;
+}
+
+// ---- 中转层的云端一半：把 6 路压成 3 个调制量，旧数据自动失效 ----------------
+// FLY_SENSE_GAIN=0 可一键退回纯原链路；STALE_MS 之后不再拿旧感官数据骗大脑。
+let senseGain = +(process.env.FLY_SENSE_GAIN || 0.18);   // 页面可调（FLY_SENSE_TUNE=1）
+// 直连通路是否真的接上了（buildSenseRoutes 决定）。用来避免 arousal 层与通道层双计。
+let senseDirectOn = false;
+
+// ---- 全脑发放率快照（看板「神经冲动」用）--------------------------------
+// 原来只用影子脑给页面供数：每 250 ms 才推进 500 步，中间断流 20 倍，
+// 神经元膜电位衰减回静息，38 组 hz 全被读成 0 —— 页面看着像"没有神经冲动"。
+// 现在改成在主脑 stepFrame 里顺手读【全部 38 组】：反正 readRates 每帧都要
+// 清零一次，读 12 个端口和读 38 组的代价几乎一样（都是遍历 6296 个计数）。
+let lastAllRates = {};
+
+// ---- 9 大功能区：把 38 个组按「感觉通道」聚合给看板用 ----------------------
+// wired=false 表示这条通道当前【根本没有传感器】，页面要显示「未接入」而不是 0 Hz。
+// 这张表同时是「这只果蝇现在瞎在哪里」的唯一口径，改动它会直接改变页面的说明文字。
+// wired 由【运行时的真实路由】决定，不写死：fixed=true 走 20 Hz 硬通道（麦克风/IMU），
+// 其余看 routes 里列出的感官路由有没有在子回路里命中。这样「页面说未接入」和
+// 「代码里到底接没接」永远是同一件事，不会出现"数据到了页面还说没接"。
+const REGION_DEF = [
+  { key: 'visual',    label: '视觉',     bases: ['LC4', 'LPLC2', 'LC16'], routes: ['visual'],   wired: false,
+    hint: '复眼 → 视叶 lobula plate。当前只有整体照度、没有空间图' },
+  { key: 'olfactory', label: '嗅觉',     bases: ['OLFA', 'OLFR'],          routes: ['olfa'],     wired: false,
+    hint: '触角嗅觉受体 ORN，SGP40 VOC 驱动' },
+  { key: 'gustatory', label: '味觉',     bases: ['SUGAR', 'BITTER'],       routes: [],           wired: false,
+    hint: '唇瓣味觉受体，目前无传感器' },
+  { key: 'auditory',  label: '听觉',     bases: ['AUDIO'],                 routes: [],           wired: true,  fixed: true,
+    hint: '江氏器听觉投射，麦克风 20 Hz 硬通道' },
+  { key: 'mechano',   label: '机械感',   bases: ['JO'],                    routes: [],           wired: true,  fixed: true,
+    hint: '江氏器风感 / 偏转，麦克风高频 + 摇杆增益' },
+  { key: 'touch',     label: '触觉',     bases: ['TOUCH'],                 routes: [],           wired: true,  fixed: true,
+    hint: '头部刚毛，BMI270 加速度 + VL53 近距叠加' },
+  { key: 'thermo',    label: '温湿度',   bases: ['THERMO', 'HYGRO'],       routes: ['thermo', 'hygro'], wired: false,
+    hint: 'AHT10 → TRPA1 类温度感受器 / 湿度感受器' },
+  { key: 'motor',     label: '运动输出', bases: ['DNp01', 'MDN', 'MN9', 'aDN1', 'DNa01', 'DNa02'], routes: [], wired: true, fixed: true,
+    hint: '下达给肌肉的指令（是结果，不是输入）' },
+  { key: 'internal',  label: '内部',     bases: ['ISN'],                   routes: [],           wired: false,
+    hint: '内部感觉神经元，来源未知' },
+];
+
+// 把「哪几路感官真的接进了脑」同步成页面的 wired 口径。
+function syncRegionWiring(routes) {
+  const have = new Set(routes.map((r) => r.key));
+  for (const d of REGION_DEF) {
+    d.wired = d.fixed ? true : (d.routes || []).some((k) => have.has(k));
+  }
+}
+const SENSE_STALE_MS = +(process.env.FLY_SENSE_STALE_MS || 2500);
+const SENSE_ZERO = { touch: 0, jo: 0, arousal: 0 };
+
+// ---- 真实解剖分区：按 FlyWire 官方 super_class 聚合 ------------------------
+// ★ 这 9 个类【不是】按我们的输入通道分的，是连接组自带的 `supers` 字段
+//   （FlyWire v783 官方注释）。看板上的脑区图就是按这 9 块画的，
+//   每一块的面积 ∝ 它在子回路里的真实神经元数，左右半脑分别上色。
+//   数据来源：results/dodge/subcircuit_v4.json 的 supers / types / sides。
+//   复核（云端）：python3 -c "import json,collections;d=json.load(open('...v4.json'));\
+//                   print(collections.Counter(zip(d['supers'],d['sides'])))"
+//   2026-11-11 实测：central 2871 / sensory 1488 / visual_projection 880 /
+//   descending 462 / optic 345 / ascending 199 / visual_centrifugal 38 /
+//   motor 11 / sensory_ascending 2，合计 6296 = 子回路总数。
+const ANAT_DEF = [
+  { id: 'central',            label: '中央脑',     note: '蘑菇体 / 中央复合体 / 各中央神经毡' },
+  { id: 'sensory',            label: '感觉输入',   note: 'ORN 嗅觉、江氏器、味觉刚毛、温湿感受器' },
+  { id: 'visual_projection',  label: '视觉投射',   note: 'LC / LPLC / Tm：视叶输出，逼近检测在这里' },
+  { id: 'descending',         label: '下行',       note: 'DN：脑 → 胸神经节的出口指令' },
+  { id: 'optic',              label: '视叶',       note: '髓质 / 小叶 / 视板本体神经元' },
+  { id: 'ascending',          label: '上行',       note: 'AN：胸神经节 → 脑' },
+  { id: 'visual_centrifugal', label: '视觉离心',   note: 'cL / cM：中央脑反向投射回视叶' },
+  { id: 'motor',              label: '运动神经元', note: '直接驱动肌肉，全子回路只有 11 个' },
+  { id: 'sensory_ascending',  label: '感觉上行',   note: 'SA，只有 2 个' },
+];
+let ANAT = [];        // buildAnatomy 填充：每项含 id/label/n/nL/nR/nC/top/names
+
+// 把 super_class 变成脑里的【只读组】（'ANAT:<id>:L|R|C'），只用于 readRates，
+// 永不 setRate —— 它们不是输入端口，是"观察窗"。
+function buildAnatomy(data, brain) {
+  const supers = data.supers;
+  if (!supers || !brain || !brain.groups) return [];
+  const by = new Map();
+  for (let i = 0; i < supers.length; i++) {
+    const s = supers[i];
+    let m = by.get(s);
+    if (!m) { m = { L: [], R: [], C: [] }; by.set(s, m); }
+    const sd = (data.sides && data.sides[i]) || 'center';
+    (sd === 'left' ? m.L : sd === 'right' ? m.R : m.C).push(i);
+  }
+  const out = [];
+  for (const d of ANAT_DEF) {
+    const m = by.get(d.id);
+    if (!m) continue;                       // 子回路里没有这一类就跳过
+    const names = {};
+    for (const [sd, idx] of [['L', m.L], ['R', m.R], ['C', m.C]]) {
+      if (!idx.length) continue;
+      const name = 'ANAT:' + d.id + ':' + sd;
+      brain.groups[name] = idx;             // 只读组
+      names[sd] = name;
+    }
+    // 真实细胞类型构成（前 4 名），核对用
+    const cnt = new Map();
+    if (data.types) {
+      for (const i of m.L) cnt.set(data.types[i], (cnt.get(data.types[i]) || 0) + 1);
+      for (const i of m.R) cnt.set(data.types[i], (cnt.get(data.types[i]) || 0) + 1);
+      for (const i of m.C) cnt.set(data.types[i], (cnt.get(data.types[i]) || 0) + 1);
+    }
+    const top = [...cnt.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4)
+      .map(([t, n]) => ({ t, n }));
+    out.push({ id: d.id, label: d.label, note: d.note, names, top,
+               n: m.L.length + m.R.length + m.C.length,
+               nL: m.L.length, nR: m.R.length, nC: m.C.length });
+  }
+  return out;
+}
+
+// 把 ANAT 组的发放率汇总成看板要的结构（每侧一个数，另给加权总平均）
+function anatomyForApi() {
+  return ANAT.map((a) => {
+    const hzL = a.names.L ? +(lastAllRates[a.names.L] || 0) : null;
+    const hzR = a.names.R ? +(lastAllRates[a.names.R] || 0) : null;
+    const hzC = a.names.C ? +(lastAllRates[a.names.C] || 0) : null;
+    // 总平均按神经元数加权，不是简单平均 —— 否则 2 个神经元的上行会把 2871 个的中央脑稀释掉
+    let sum = 0, cnt = 0;
+    for (const [sd, w] of [['L', a.nL], ['R', a.nR], ['C', a.nC]]) {
+      if (!a.names[sd] || !w) continue;
+      sum += (lastAllRates[a.names[sd]] || 0) * w; cnt += w;
+    }
+    return { id: a.id, label: a.label, note: a.note,
+             n: a.n, nL: a.nL, nR: a.nR, nC: a.nC,
+             hz: cnt ? +(sum / cnt).toFixed(2) : 0,
+             hzL, hzR, hzC, top: a.top };
+  });
+}
+
+function senseModulation(s, now) {
+  if (!s || senseGain <= 0) return SENSE_ZERO;
+  const age = now - s.at;
+  if (age > SENSE_STALE_MS) return SENSE_ZERO;
+  const decay = 1 - age / SENSE_STALE_MS;
+  const v = s.valid || 0;
+  // 这里的 env 只代表「整体唤醒水平」，不是通道本身。
+  // 直连打开后 VOC / 照度 / 温湿度 各自已有靶组，如果再按原权重计入 arousal
+  // 就是同一条物理量被算两次（通道层 + 唤醒层），会系统性放大反应。
+  // 所以直连打开时权重减半：唤醒层只保留"环境变化确实让人更警觉"这部分的边际贡献。
+  const dup = senseDirectOn ? 0.5 : 1;
+  let env = 0;
+  if (v & SENSE_VALID.TEMPRH) {
+    env += Math.min(1, Math.abs(s.tempC - 25) / 20) * 0.25;
+    env += Math.min(1, Math.abs(s.rh - 50) / 50) * 0.20;
+  }
+  if (v & SENSE_VALID.LUX)  env += Math.min(1, s.lux / 2000) * 0.15;
+  if (v & SENSE_VALID.VOC)  env += Math.min(1, s.voc / 1000) * 0.30;
+  // 近距障碍没有"自己的组"（走 TOUCH 快通道），所以这一项永远全额计。
+  if (v & SENSE_VALID.DIST) env += clamp01(1 - s.distMm / 800) * 0.35;
+  env *= dup;
+  // B 脊髓通路：板端已把摇杆 / 测距压成方向、事件码、显著度，这里直接当调制量。
+  const joyMag = (v & SENSE_VALID.JOY) ? Math.min(1, Math.hypot(s.joyX, s.joyY) / 1000) : 0;
+  const near = s.event === 9 ? 1 : (s.event === 10 ? 0.3 : 0);
+  return {
+    touch: senseGain * decay * clamp01(joyMag * 0.55 + near * 0.45),
+    jo: senseGain * decay * ((v & SENSE_VALID.JOY) ? clamp01(Math.abs(s.joyX) / 1000) : 0),
+    arousal: senseGain * decay * clamp01(env * 0.6 + s.arousal / 255 * 0.4),
+  };
+}
+
+// ---- A 路「真·直连」：每路传感器各驱动自己的靶组，绝不复用同一个标量 --------
+// 这是整个项目「精度」的落点。每个驱动率都能回答三件事：
+//   ① 哪个传感器 ② 物理量经什么公式 ③ 驱动了哪几组、共多少个神经元。
+// 与快通道（touch/jo 叠进 intensity、每帧被 stepFrame 覆盖）严格分家：
+// 这里驱动的组名与 AUDIO/JO/TOUCH 不重叠，所以 2 Hz 写一次、保持到下一帧不会打架。
+//
+// 物理依据（每条都能被反驳，不写"大概"）：
+//   THERMO    TRPA1 类温度感受器   对【偏离舒适区】敏感，U 型调谐 → |T-24|/12 饱和
+//   HYGRO     湿度感受器           → |RH-50|/45 饱和
+//   OLFA/OLFR 触角嗅觉受体 ORN     受体在饱和前近似幂律 → (voc/1000)^1.5
+//   LC4 等    视叶 lobula plate    只有整体照度、没有空间图 → 上限 0.35 rMax（明确是近似）
+//   TOUCH     头部刚毛             VL53 近距(<300mm) 走快通道叠加，不在此处驱动
+//   摇杆      ——                   实验者意志注入，不是果蝇感官 → 不进任何感觉组
+const SENSE_ROUTES = [
+  { key: 'thermo', bit: SENSE_VALID.TEMPRH, src: 'AHT10.T', unit: '℃', cap: 1.00,
+    groups: ['THERMO_left', 'THERMO_right'],
+    pick: (s) => s.tempC,
+    norm: (s) => clamp01(Math.abs(s.tempC - 24) / 12) },
+  { key: 'hygro', bit: SENSE_VALID.TEMPRH, src: 'AHT10.RH', unit: '%RH', cap: 0.85,
+    groups: ['HYGRO_left', 'HYGRO_right'],
+    pick: (s) => s.rh,
+    norm: (s) => clamp01(Math.abs(s.rh - 50) / 45) },
+  { key: 'olfa', bit: SENSE_VALID.VOC, src: 'SGP40.VOC', unit: 'idx', cap: 1.00,
+    groups: ['OLFA_left', 'OLFA_right', 'OLFR_left', 'OLFR_right'],
+    pick: (s) => s.voc,
+    norm: (s) => Math.pow(clamp01(s.voc / 1000), 1.5) },
+  { key: 'visual', bit: SENSE_VALID.LUX, src: 'BH1750.lux', unit: 'lx', cap: 0.35,
+    groups: ['LC4_left', 'LC4_right', 'LPLC2_left', 'LPLC2_right', 'LC16_left', 'LC16_right'],
+    // LC16 是【方向】通道：它得按左右差动驱动（每个 20 Hz 帧重写），不能在这里被双侧同幅覆盖，
+    // 否则差动信号每 500 ms 就被抹平一次。见 3b 段与 applySenseChannels。
+    skip: ['LC16_left', 'LC16_right'],
+    pick: (s) => s.lux,
+    norm: (s) => Math.pow(clamp01(s.lux / 2000), 0.5) },
+];
+
+// 不硬编码组名（subcircuit_v4.json 不在本仓分发）：启动时按实际 data.groups 探测，
+// 一路都没命中就整路作废，assertPorts() 完全不受影响。
+function buildSenseRoutes(data) {
+  if (process.env.FLY_SENSE_PORT === '0') {
+    console.log('=== 感官直连：FLY_SENSE_PORT=0，整条直连通路关闭（只剩 arousal 调制）');
+    syncRegionWiring([]);
+    senseDirectOn = false;
+    return [];
+  }
+  const names = data.groups ? Object.keys(data.groups) : [];
+  const routes = [];
+  for (const r of SENSE_ROUTES) {
+    const hit = r.groups.filter((n) => names.includes(n));
+    if (!hit.length) {
+      console.log(`  ! 感官直连 ${r.key}：${r.groups.join('/')} 均不在子回路里，该路作废`);
+      continue;
+    }
+    const neurons = hit.reduce((a, n) => a + data.groups[n].length, 0);
+    routes.push({ ...r, groups: hit, neurons });
+  }
+  if (!routes.length) console.log('=== 感官直连：未命中任何组，降级为调制模式');
+  else {
+    console.log(`=== 感官直连就绪（${routes.length} 路，共 ${routes.reduce((a, r) => a + r.neurons, 0)} 个神经元）：`);
+    for (const r of routes)
+      console.log(`    ${r.key.padEnd(7)} ${r.src.padEnd(11)} → ${r.groups.join(',')}  [${r.neurons} 个] 上限 ${(r.cap * 100).toFixed(0)}% rMax`);
+  }
+  syncRegionWiring(routes);
+  senseDirectOn = routes.length > 0;
+  return routes;
+}
+
+// 最近一次「传感器 → 靶组」的实际驱动明细，供 /api 与看板直接展示。
+let lastSenseDrive = {};
+
+function applySenseChannels(brain, s, routes) {
+  if (!routes.length) { lastSenseDrive = {}; return; }
+  // 硬门控而非时间衰减：2 Hz 更新 + 500 ms 保持，衰减会在两次更新之间造成 10% 锯齿。
+  const fresh = (Date.now() - s.at) <= SENSE_STALE_MS;
+  const out = {};
+  for (const r of routes) {
+    const ok = fresh && !!(s.valid & r.bit);
+    const norm = ok ? clamp01(r.norm(s)) : 0;
+    const hz = CFG.rMaxHz * norm * r.cap * senseGain;
+    for (const g of r.groups) if (!(r.skip && r.skip.indexOf(g) >= 0)) brain.setRate(g, hz);
+    // 视觉方向通道的工作点单独标定：cap/gain 那一套是"感觉有多强"，这里要的是
+    // "足够让 DNa02 有可分辨左右差"（实测 base < 100 Hz 时 DNa 几乎不动）。
+    if (r.key === 'visual') {
+      const lum01 = ok ? Math.pow(clamp01(s.lux / 2000), 0.5) : 0;
+      // 门槛 0.08 对应约 15 lx：再暗就当"看不见"，视觉方向通道整个熄火（turn 退回反射），
+      // 否则最暗档也留 30 Hz，夜里精灵会一直被一个来路不明的偏置推着走。
+      VIS.base = lum01 < 0.08 ? 0
+        : STEER.baseMin + (STEER.baseMax - STEER.baseMin) * lum01;
+      VIS.at = Date.now();
+    }
+    out[r.key] = {
+      src: r.src, unit: r.unit,
+      raw: ok ? +(+r.pick(s)).toFixed(2) : null,
+      norm: +norm.toFixed(3),
+      hz: +hz.toFixed(1),
+      groups: r.groups, neurons: r.neurons,
+      mapped: ok,
+    };
+  }
+  // 摇杆 → 侧化（人在环中：向右推杆 = 想右转 = 右侧更亮）。
+  // 摇杆回中 / 数据过期后自动交出控制权，退回 IMU 侧向加速度（见 visLatNow）。
+  if (fresh && (s.valid & SENSE_VALID.JOY) && Math.abs(s.joyX) > 120) {
+    VIS.lat = clamp(-s.joyX / 1000, -1, 1); VIS.src = 'joy'; VIS.at = Date.now();
+  } else if (VIS.src === 'joy') VIS.src = 'imu';
+  lastSenseDrive = out;
+}
+
 // 二进制 68 B 帧编码（合成数据用；布局严格对齐 probe_common.h / udp_probe_server.py）
 function encodeFeature68(o) {
   const b = Buffer.alloc(68);
@@ -275,10 +616,33 @@ const EMA_TAU_MS = 200, EMA_A = 1 - Math.exp(-STEP_MS / EMA_TAU_MS);
 const TH = { escape: 15, back: 20, feed: 30, groom: 20 };      // 沿用 game_core.js 量级
 
 function newEma() {
-  return { escape: 0, steer1L: 0, steer1R: 0, steer2L: 0, steer2R: 0, back: 0, feed: 0, groom: 0, arousal: 0 };
+  return { escape: 0, steer1L: 0, steer1R: 0, steer2L: 0, steer2R: 0, back: 0, feed: 0, groom: 0, arousal: 0,
+           steerRaw: 0 };   // 脑内转向信号（DNa02+DNa01 左右差）的平滑值
 }
+// 转向基线（慢适应）：恒定光照下 DNa 有固有偏置（实测 base150 且不差动时 +12 Hz），
+// 不减掉的话精灵会一直往一边飘。2.5 s 常数 ≈ 果蝇对持续光流的习惯化。
+let steerBase = 0, steerBaseReady = false;
+function resetSteer() { steerBase = 0; steerBaseReady = false; VIS.base = 0; VIS.lat = 0; VIS.src = 'none'; }
 function newChState() { return { t: 0, deadRun: 0, wakeLeft: 0, wakeCh: null, wakeEvents: 0 }; }
 const steerOf = (ema) => (ema.steer1L - ema.steer1R + ema.steer2L - ema.steer2R) / 2;
+
+// 侧化信号：谁更亮（+1 = 全左 / −1 = 全右）。
+// 优先摇杆 joyX（人在环中：向右推杆 = 想右转 = 右侧亮），2 s 内的数据才算；否则用 IMU。
+// IMU 的语义：lat>0 表示"从右侧被推"，等价于"左边更亮 → 往左躲"，所以直接取 +lat。
+function visLatNow(intensity) {
+  if (VIS.src === 'joy' && (Date.now() - VIS.at) <= SENSE_STALE_MS)
+    return { lat: clamp(VIS.lat, -1, 1), src: 'joy' };
+  return { lat: clamp(intensity.lat || 0, -1, 1), src: 'imu' };
+}
+// 视觉方向端口探测：子回路里没有 LC16 就整条脑转向作废（退回反射），组名绝不硬编码到别处
+function detectSteerPorts(data) {
+  const g = (data && data.groups) || {};
+  if (!g['LC16_left'] || !g['LC16_right']) {
+    console.log('  ! 转向：子回路里没有 LC16_left/right，脑转向不可用 → turn 退回 IMU 反射');
+    return null;
+  }
+  return { L: 'LC16_left', R: 'LC16_right' };
+}
 
 function stepFrame(brain, arb, chState, ema, intensity, seq, tMs, opts) {
   opts = opts || {};
@@ -310,15 +674,23 @@ function stepFrame(brain, arb, chState, ema, intensity, seq, tMs, opts) {
   brain.setRate(IN_PORT.jo.L, w.jo);       brain.setRate(IN_PORT.jo.R, w.jo);
   brain.setRate(IN_PORT.touch.L, w.touch); brain.setRate(IN_PORT.touch.R, w.touch);
 
+  // ---- 视觉方向通道：LC16 左右【差动】，turn 的唯一来源（见 3b 段）------------
+  // 与上面三条通道的区别：那三条是"双侧同幅"（强度），这里是"左右分配"（方向）。
+  // 总驱动 = VIS.base（照度给），只是把 (1±lat) 的配比挪到两侧 —— 光没变，方向变了。
+  const vs = visLatNow(intensity);
+  if (STEER.mode === 'brain' && VIS_PORT && VIS.base > 0) {
+    brain.setRate(VIS_PORT.L, clamp(VIS.base * (1 + vs.lat), 0, CFG.rMaxHz));
+    brain.setRate(VIS_PORT.R, clamp(VIS.base * (1 - vs.lat), 0, CFG.rMaxHz));
+  } else if (VIS_PORT) {
+    brain.setRate(VIS_PORT.L, 0); brain.setRate(VIS_PORT.R, 0);
+  }
+
   const t0 = process.hrtime.bigint();
   brain.run(STEPS_PER_FRAME);
   const brainMs = Number(process.hrtime.bigint() - t0) / 1e6;
 
-  const r = brain.readRates([
-    OUT_PORT.escape.L, OUT_PORT.escape.R, OUT_PORT.steer1.L, OUT_PORT.steer1.R,
-    OUT_PORT.steer2.L, OUT_PORT.steer2.R, OUT_PORT.back.L, OUT_PORT.back.R,
-    OUT_PORT.feed.L, OUT_PORT.feed.R, OUT_PORT.groom.L, OUT_PORT.groom.R,
-  ], STEPS_PER_FRAME);
+  const r = brain.readRates(Object.keys(brain.groups), STEPS_PER_FRAME);
+  lastAllRates = r;   // 全 38 组真实发放率，供只读 API 直接取用（不再跑影子脑）
 
   const mix = (a, b) => (r[a] + r[b]) / 2;
   const esc = mix(OUT_PORT.escape.L, OUT_PORT.escape.R);
@@ -331,6 +703,10 @@ function stepFrame(brain, arb, chState, ema, intensity, seq, tMs, opts) {
     steer2L: r[OUT_PORT.steer2.L], steer2R: r[OUT_PORT.steer2.R],
     back, feed, groom, arousal: esc,
   };
+  // 脑内转向信号：DNa02（转向）为主 + DNa01（小步转向）为辅。
+  // 0.4 的权重来自单侧视觉刺激实测（LC16 单侧：DNa02 差 34~55、DNa01 差 40~43，同量级；
+  // 加权后两者方向一致、不互相抵消，取辅权重是为了让 DNa02 主导）。
+  raw.steerRaw = (raw.steer2L - raw.steer2R) + 0.4 * (raw.steer1L - raw.steer1R);
   for (const k of Object.keys(ema)) ema[k] += EMA_A * (raw[k] - ema[k]);
 
   // ---- 行为判定 ----
@@ -339,10 +715,28 @@ function stepFrame(brain, arb, chState, ema, intensity, seq, tMs, opts) {
   if (ema.escape > TH.escape) flags |= FLAG.ESCAPE;
   if (ema.groom > TH.groom) flags |= FLAG.GROOM;
   if (ema.feed > TH.feed) flags |= FLAG.FEED;
-  // 方向由【带符号侧向加速度】给（★见文件头结构性更正①）：lat>0 = 从右被推 → 左转
+  // ---- 方向：脑的转向 DN 说了算；没有视觉可给时退回 IMU 反射 ---------------
   const lat = intensity.lat || 0;
-  if (lat > CFG.turnDeadband) flags |= FLAG.LEFT;
-  else if (lat < -CFG.turnDeadband) flags |= FLAG.RIGHT;
+  const brainSteer = STEER.mode === 'brain' && !!VIS_PORT && VIS.base > 0;
+  let turn, steerSrc;
+  if (brainSteer) {
+    if (!steerBaseReady) { steerBase = ema.steerRaw; steerBaseReady = true; }
+    // 只在【没有转向指令】时学基线：否则一按摇杆持续右转，2.5 s 后就被适应成"直行"了。
+    // 有指令（|visLat| ≥ 0.15）时冻结基线，偏置照旧被扣掉，指令原样通过。
+    if (Math.abs(vs.lat) < 0.15)
+      steerBase += (1 - Math.exp(-STEP_MS / STEER.adaptMs)) * (ema.steerRaw - steerBase);
+    // ★ 极性来自实测，不是猜的：LC16_right 更强 → DNa02(L−R) 变【正】（+55 Hz），
+    //   LC16_left 更强 → 变负（−34 Hz）。即"右侧更亮 → 正差 → 右转"，所以直接取正号。
+    turn = clamp((ema.steerRaw - steerBase) / STEER.scale, -1, 1);
+    if (Math.abs(turn) < STEER.deadband) turn = 0;
+    steerSrc = vs.src === 'joy' ? 'brain:joy' : 'brain:imu';
+  } else {
+    turn = clamp(-lat, -1, 1);                       // lat>0(右推) → 左转
+    steerSrc = STEER.mode === 'reflex' ? 'reflex' : 'reflex-novis';
+  }
+  const db = brainSteer ? STEER.deadband : CFG.turnDeadband;
+  if (turn < -db) flags |= FLAG.LEFT;
+  else if (turn > db) flags |= FLAG.RIGHT;
 
   const motorOn = ema.escape > TH.escape;
 
@@ -373,10 +767,12 @@ function stepFrame(brain, arb, chState, ema, intensity, seq, tMs, opts) {
 
   return {
     w, r, ema: { ...ema }, dead, woke, wakeLeft: chState.wakeLeft,
-    steer: -lat, dnaSteer: steerOf(ema),          // dnaSteer 仅诊断（v4 里不是可靠转向信号）
+    steer: turn, dnaSteer: steerOf(ema),   // dnaSteer = DNa01 左右差（诊断用，不再参与决策）
+    steerInfo: { src: steerSrc, visLat: +vs.lat.toFixed(3), visBase: +VIS.base.toFixed(1),
+                 raw: +ema.steerRaw.toFixed(2), base: +steerBase.toFixed(2), turn: +turn.toFixed(3) },
     cmd: {
       seq, echo_ts_us: 0,
-      turn: clamp(-lat, -1, 1),                    // lat>0(右推) → turn<0(左转)，与 flags 一致
+      turn,                                        // 由脑的 DNa 给出（见 3b 段），无视觉时退回反射
       thrust: motorOn ? 1 : 0.15,
       motor: motorOn ? 1 : 0,
       arousal: clamp01(ema.arousal / 40),
@@ -397,6 +793,7 @@ function resetIo(brain) {
 }
 function warmBrain(brain, seed) {
   brain.reset(); brain.reseed(seed); resetIo(brain);
+  resetSteer();                          // 每次预热都清掉转向基线，bench 之间不串味
   brain.run(10000);                      // 1 s 生物时间预热（与 bench 同口径）
   brain.readRates(Object.values(OUT_PORT).map((p) => p.L), 1);
 }
@@ -527,15 +924,102 @@ function startServer(data, argv) {
 
   const brain = new ConnectomeBrain(data, 1);
   warmBrain(brain, 1);
+  // 转向端口：没有 LC16 就整条脑转向作废（turn 退回反射），并明确写进日志
+  VIS_PORT = detectSteerPorts(data);
+  console.log(`=== 转向：${STEER.mode === 'brain' && VIS_PORT ? '脑（LC16 左右差 → DNa02/DNa01 → turn）'
+    : 'IMU 反射（脑转向未启用）'}  满舵 ${STEER.scale} Hz，死区 ${STEER.deadband}，`
+    + `视觉工作点 ${STEER.baseMin}–${STEER.baseMax} Hz`);
+  // 真实解剖分区：必须在第一次 readRates 之前挂上，否则组不存在、页面拿到空
+  ANAT = buildAnatomy(data, brain);
+  if (ANAT.length) {
+    const tot = ANAT.reduce((a, x) => a + x.n, 0);
+    console.log(`=== 解剖分区（FlyWire super_class，${ANAT.length} 类 / ${tot} 个神经元）：`);
+    for (const a of ANAT) {
+      console.log(`    ${a.label.padEnd(6)} ${a.id.padEnd(19)} ${String(a.n).padStart(5)} 个`
+        + ` (L${a.nL}/R${a.nR}${a.nC ? '/C' + a.nC : ''})  `
+        + a.top.map((t) => t.t + ' ' + t.n).join(', '));
+    }
+  }
   const ema = newEma(), st = newChState();
 
   const sock = dgram.createSocket('udp4');
   let frames = 0, rejects = 0, dead = 0, wasted = 0, tPrev = 0;
   let lastStats = Date.now();
+  let lastSense = null, senseFrames = 0, senseRejects = 0;
+  const senseRoutes = buildSenseRoutes(data);
+  // ---- 感官叠加层：只在「原本的 featuresToIntensity(f)」外包一层 -------------
+  // 无感官帧 / 数据过期 / gain=0 时 senseApply 原样返回入参（零分配、零行为差异），
+  // 因此 68 B / 20 Hz 主链路在关闭感官时与改动前逐字等价。
+  let lastMod = null;
+  let senseDecayed = false;   // 归零看门狗：只做一次，收到新帧后再武装
+  // 把 4 路靶组归零，并把明细标成"未映射"。
+  // 为什么不放在下面那个 if 里/为什么不放在 senseApply：setRate 写下的是持久的
+  // stimProb，而 senseApply 只在**收到 68 B 帧**时才执行 —— 板子一挂，68 B 也不来了，
+  // 用"收帧"去检测"没帧"永远等不到。必须是独立时钟。
+  const zeroSenseRoutes = () => {
+    for (const r of senseRoutes) for (const g of r.groups) brain.setRate(g, 0);
+    // 视觉方向通道也要一起熄火：否则最后那点 lux 会一直撑着 turn 的来源判定
+    VIS.base = 0; VIS.src = 'none';
+    // 表格里保留关键位，但明确标成"未映射 / 0 Hz"，不能整表消失（那会被读成"没启用"）。
+    const out = {};
+    for (const r of senseRoutes) {
+      out[r.key] = { src: r.src, unit: r.unit, raw: null, norm: 0, hz: 0,
+                     groups: r.groups, neurons: r.neurons, mapped: false };
+    }
+    lastSenseDrive = out;
+  };
+  const senseWatchdog = setInterval(() => {
+    if (!lastSense || senseDecayed) return;
+    if ((Date.now() - lastSense.at) <= SENSE_STALE_MS) return;
+    senseDecayed = true;
+    zeroSenseRoutes();
+    if (!quiet) console.log(`  ! 感官帧已中断 ${Math.round((Date.now() - lastSense.at) / 1000)}s，`
+                          + `靶组归零（${senseRoutes.reduce((a, r) => a + r.neurons, 0)} 个神经元）`);
+  }, 250);
+  if (senseWatchdog.unref) senseWatchdog.unref();   // 别拦住进程退出
+  const senseApply = (base) => {
+    lastMod = senseModulation(lastSense, Date.now());
+    if (!lastMod.touch && !lastMod.jo) return base;
+    return { ...base, touch: clamp01(base.touch + lastMod.touch),
+             jo: clamp01(base.jo + lastMod.jo) };
+  };
+  const senseArousal = (a) => (lastMod && lastMod.arousal) ? clamp01(a + lastMod.arousal) : a;
+  const senseForApi = () => {
+    // ★ 关键：`lastSense` 只代表"曾经收到过"。板子拔掉 / relay 停了之后它会永远留着，
+    //   旧写法 `online: !!lastSense` 于是让面板一直显示"在线"，而数据年龄已经几分钟。
+    //   在线与否必须由【时效】判定，与前端怎么读无关。
+    const ageMs = lastSense ? (Date.now() - lastSense.at) : Infinity;
+    return {
+      online: ageMs <= SENSE_STALE_MS,
+      everSeen: !!lastSense,
+      ageMs: lastSense ? ageMs : null,
+      frames: senseFrames, rejects: senseRejects,
+      gain: senseGain, staleMs: SENSE_STALE_MS,
+      tune: process.env.FLY_SENSE_TUNE === '1',
+      // 路数是【配置】层面的信息，和"有没有数据"无关：
+      // 板子没上电时 senseDrive 是空的，前端不能因此判定"直连未启用"（那是两件事）。
+      routes: (senseRoutes || []).length,
+      ...(lastSense || {}),
+    };
+  };
   // 只读 API 的状态（--api 关闭时全程为 null / 0，不产生任何开销）
-  let lastFrameForApi = null, lastCmdForApi = {}, lastBrainMsForApi = 0;
+  let lastFrameForApi = null, lastCmdForApi = {}, lastBrainMsForApi = 0, lastSteerForApi = {};
 
   sock.on('message', (msg, rinfo) => {
+    // 40 B 感官帧：只解码、只存，不步进大脑、不回下行帧。
+    if (msg.length === SENSE_LEN) {
+      try {
+        const s = decodeSense40(msg);
+        s.at = Date.now();
+        lastSense = s; senseFrames++;
+        senseDecayed = false;            // 有新帧到达 → 重新武装归零看门狗
+        applySenseChannels(brain, s, senseRoutes);
+      } catch (e) {
+        senseRejects++;
+        if (!quiet) console.log(`  ! 感官坏帧 ${msg.length} B（${e.message}）`);
+      }
+      return;
+    }
     let f;
     try { f = decodeFeature68(msg); }
     catch (e) {
@@ -544,28 +1028,32 @@ function startServer(data, argv) {
       return;
     }
     const dt = tPrev ? Date.now() - tPrev : 50; tPrev = Date.now();
-    const o = stepFrame(brain, strategy, st, ema, featuresToIntensity(f), f.seq, Date.now(), { watchdog });
+    const o = stepFrame(brain, strategy, st, ema, senseApply(featuresToIntensity(f)), f.seq, Date.now(), { watchdog });
     // Echo the board's own send timestamp back so it can measure the real RTT.
     // Without this the field stays 0 and the board's RTT degenerates into
     // "uptime so far" - which is what happened on the first hardware run.
     o.cmd.echo_ts_us = f.send_ts_us >>> 0;
+    o.cmd.arousal = senseArousal(o.cmd.arousal);
     const dl = encodeDownlink(o.cmd);
     sock.send(dl, rinfo.port, rinfo.address);
     frames++;
     if (o.dead) dead++;
     wasted += o.brainMs;
     // 给只读 API 的影子脑留一份最近特征（--api 开启时才需要）
-    if (apiPort > 0) { lastFrameForApi = { features: f, seq: f.seq }; lastCmdForApi = o.cmd; lastBrainMsForApi = o.brainMs; }
+    if (apiPort > 0) { lastFrameForApi = { features: f, seq: f.seq }; lastCmdForApi = o.cmd; lastBrainMsForApi = o.brainMs;
+      lastSteerForApi = o.steerInfo || {}; }
     if (!quiet) {
+      // 原有日志口径：未叠加感官的原始强度（感官只叠在 stepFrame 的入参上）
       const inten = featuresToIntensity(f);
       console.log(`  #${String(f.seq).padStart(6)}  aud ${inten.audio.toFixed(2)} tou ${inten.touch.toFixed(2)} jo ${inten.jo.toFixed(2)} lat ${inten.lat.toFixed(2)}`
         + `  → esc ${o.ema.escape.toFixed(1)} groom ${o.ema.groom.toFixed(1)}  flags 0x${o.cmd.flags.toString(16).padStart(2, '0')} ${flagNames(o.cmd.flags)}`
-        + `  turn ${o.cmd.turn.toFixed(2)}  ${o.brainMs.toFixed(1)}ms（到达间隔 ${dt}ms）`);
+        + `  turn ${o.cmd.turn.toFixed(2)}[${o.steerInfo.src}]  ${o.brainMs.toFixed(1)}ms（到达间隔 ${dt}ms）`);
     }
     const now = Date.now();
     if (now - lastStats > 3000) {
       lastStats = now;
       console.log(`  --- 已处理 ${frames} 帧，静息 ${(100 * dead / frames).toFixed(0)}%，平均脑步 ${(wasted / frames).toFixed(1)} ms/帧，丢弃 ${rejects}`);
+      if (senseFrames) console.log(`  --- 感官帧 ${senseFrames}（坏 ${senseRejects}），增益 ${senseGain.toFixed(2)}`);
     }
   });
   sock.on('listening', () => {
@@ -580,29 +1068,55 @@ function startServer(data, argv) {
   // 目的：让网页看板能看见【脑内部】在放什么，而不只是行为标量。
   // 做法：另开一个 HTTP 口，暴露 38 个神经元组的实时发放率。纯只读，不参与闭环。
   //
-  // 关键实现点：`brain.readRates()` 会把计数清零，所以【不能】在 stepFrame 里顺带读
-  // 全部38 组（那会让 12 个行为输出端口的读数归零，行为判定立刻崩）。
-  // 正确做法是让 API 在**独立的短窗口**里跑一个影子副本：把同样的驱动打进去，
-  // 跑 STEPS_PER_FRAME 步，读一次全组，再丢掉。代价是每 250 ms 多一次脑步
-  // （约 18 ms，占单核 7%），换来的是看板能看到真实的组活跃度。
+  // 关键实现点：`brain.readRates()` 会把计数清零，所以一个窗口只能读一次。
+  // 早期做法是另跑一个影子副本给页面供数（怕把 12 个行为端口的读数读空）。
+  // 但影子脑每 250 ms 才推进 500 步、中间断流 20 倍，膜电位衰减回静息，
+  // 38 组全被读成 0 Hz —— 页面看着就像"没有神经冲动"。
+  // 现在改为：主脑 stepFrame 里一次读【全部 38 组】，12 个端口从这份结果里取，
+  // 既不重复清零，也不用再跑影子脑（顺带省掉那 7% CPU）。
   if (apiPort > 0) {
-    const ghost = new ConnectomeBrain(data, 1);
-    const probeNames = Object.keys(data.groups);
-    const ghostEma = newEma(), ghostSt = newChState();
-    let ghostRates = {};
+    // 必须排掉 ANAT:* 只读组：ConnectomeBrain 里 this.groups === data.groups（同一个对象引用），
+    // buildAnatomy 往 brain.groups 里塞的解剖组会一并出现在 data.groups 里，
+    // 不过滤就会让右侧「38 个神经元组」表里混进 ANAT:sensory:L 这种观察窗。
+    const probeNames = Object.keys(data.groups).filter((n) => !n.startsWith('ANAT:'));
 
     const http = require('http');
     http.createServer((req, res) => {
+      // 可选调参：默认关闭，只在 FLY_SENSE_TUNE=1 时存在；只改一个内存变量，
+      // 不重启进程、不碰 68 B 链路，且只监听 127.0.0.1。
+      if (process.env.FLY_SENSE_TUNE === '1' && req.url.startsWith('/api/sense?')) {
+        const g = Number(new URL(req.url, 'http://127.0.0.1').searchParams.get('gain'));
+        if (Number.isFinite(g)) senseGain = Math.max(0, Math.min(1, g));
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, gain: senseGain }));
+        return;
+      }
       if (req.url !== '/api') { res.writeHead(404); res.end(); return; }
       const groups = probeNames.map((name) => {
         const m = name.match(/^(.*)_(left|right)$/);
+        const base = m ? m[1] : name;
+        const def = REGION_DEF.find((x) => x.bases.indexOf(base) >= 0);
         return {
           name,
-          base: m ? m[1] : name,
+          base,
           side: m ? m[2] : '',
           n: data.groups[name].length,
-          hz: +((ghostRates[name]) || 0).toFixed(2),
+          hz: +((lastAllRates[name]) || 0).toFixed(2),
+          wired: def ? def.wired : false,
+          nerve: def ? def.label : '其它',
         };
+      });
+      // 区域聚合：每条通道取组间平均（各组已是组内平均发放率）。
+      const regions = REGION_DEF.map((d) => {
+        let sum = 0, cnt = 0;
+        for (const name of probeNames) {
+          const base = name.replace(/_(left|right)$/, '');
+          if (d.bases.indexOf(base) >= 0) { sum += (lastAllRates[name] || 0); cnt++; }
+        }
+        return { key: d.key, label: d.label, hint: d.hint, wired: d.wired,
+                 groups: cnt, hz: cnt ? +(sum / cnt).toFixed(2) : 0,
+                 // 该区当前由哪个传感器、什么原值、经什么公式驱动（未直连时为 null）
+                 drive: (d.routes || []).map((k) => lastSenseDrive[k]).filter(Boolean) };
       });
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
@@ -612,21 +1126,25 @@ function startServer(data, argv) {
         processed: frames,
         cmd: lastCmdForApi,
         groups,
-        gates: { GATE_DB, GATE_SPAN, MAPV: process.env.MAPV || 'v6' },
+        regions,
+        // GATE_DB/GATE_SPAN 是 featuresToIntensity() 里的局部名 gateDb/gateSpan，
+        // 这里原本直接写成大写标识符 → 开 --api 后首个 /api 请求就 ReferenceError
+        // 并让整个大脑进程退出。改为与取值处一致地读环境变量。
+        gates: { GATE_DB: +(process.env.GATE_DB || -44),
+                 GATE_SPAN: +(process.env.GATE_SPAN || 16),
+                 MAPV: process.env.MAPV || 'v6' },
+        sense: senseForApi(),
+        // 转向：turn 从哪来（brain:joy / brain:imu / reflex / reflex-novis）+ 脑内左右差与基线
+        steer: { ...lastSteerForApi, mode: STEER.mode, scale: STEER.scale,
+                 visPort: VIS_PORT ? VIS_PORT.L.replace('_left', '') : null },
+        // 真实解剖分区（super_class）：脑区图用它上色，不是按输入通道分的
+        anatomy: anatomyForApi(),
+        // 传感器 → 靶组的实际驱动明细（哪路、原值、归一化、Hz、几个神经元）
+        senseDrive: lastSenseDrive,
       }));
     }).listen(apiPort, '127.0.0.1', () => {
       console.log(`=== 只读 API：http://127.0.0.1:${apiPort}/api （${probeNames.length} 个神经元组）`);
     });
-
-    setInterval(() => {
-      if (!lastFrameForApi) return;
-      try {
-        // 用最近一帧的真实特征驱动影子脑，量每一组的发放率。
-        const it = featuresToIntensity(lastFrameForApi.features);
-        stepFrame(ghost, strategy, ghostSt, ghostEma, it, lastFrameForApi.seq, Date.now(), { watchdog });
-        ghostRates = ghost.readRates(probeNames, STEPS_PER_FRAME);
-      } catch (e) { /* 影子脑失败不影响主闭环 */ }
-    }, 250);
   }
 
   process.on('SIGINT', () => {
@@ -820,6 +1338,7 @@ const HELP = `用法：node stage1_loop.js <模式> [选项]
   --emit-dl FILE      把 --synth 的真实 MPRC 下行流写成文件（32 B/帧）
   --grid              死区看门狗验证（二维强度网格）
   --selftest          MPRC/MPRB 编解码自检
+                      （另校验 40 B MPRS 感官帧的黄金帧与 CRC 反例）
   --emit FILE         生成合成上行二进制帧文件
   --blast HOST:PORT   经 UDP 发送合成帧（配合 --serve 联测）
   --serve             常驻：UDP 收 68 B → 跑脑 → 回 32 B MPRC
@@ -852,9 +1371,27 @@ function main() {
     const cmd = { seq: 42, echo_ts_us: 123456, turn: -0.4, thrust: 0.8, motor: 0.5, arousal: 0.7, flags: FLAG.ESCAPE | FLAG.LEFT, groom: 0.1, feed: 0.2, link_q: 0.99, brain_load: 0.35 };
     const back = decodeDownlink(encodeDownlink(cmd));
     const up = decodeFeature68(encodeFeature68({ seq: 7, send_ts_us: 555, rms_dbfs: -30, band_low: -35, band_mid: -38, band_high: -50, accel: [0.1, 0, 1.0] }));
+    const senseObj = { seq: 9, sendTsUs: 777, tempC: 26.5, rh: 52.25, lux: 320,
+      voc: 420, distMm: 180, joyX: -640, joyY: 880, valid: 0x1F,
+      event: 2, arousal: 96, spare: 0 };
+    const sb = encodeSense40(senseObj);
+    const sd = decodeSense40(sb);
+    const bad = Buffer.from(sb); bad[20] ^= 1;
+    let rejected = false;
+    try { decodeSense40(bad); } catch (e) { rejected = true; }
+    const senseOk = sb.length === 40
+      && sb.toString('hex') === GOLDEN_SENSE_HEX
+      && sd.seq === 9 && Math.abs(sd.tempC - 26.5) < 0.005
+      && Math.abs(sd.rh - 52.25) < 0.005
+      && sd.joyX === -640 && sd.joyY === 880
+      && sd.valid === 0x1F && sd.event === 2 && sd.arousal === 96
+      && rejected;
+    if (!senseOk) { console.log('SELFTEST FAIL (MPRS 40 B 黄金帧对拍不一致)'); process.exit(1); }
     const ok = Math.abs(back.turn - cmd.turn) <= 1 / 127 && back.flags === cmd.flags && up.seq === 7 && Math.abs(up.band_low + 35) < 1e-3;
     console.log('MPRC 自检:', encodeDownlink(cmd).toString('hex'));
     console.log('MPRB 回读:', JSON.stringify(up));
+    console.log('MPRS 自检:', sb.toString('hex'));
+    console.log('MPRS 回读:', JSON.stringify(sd));
     console.log(ok ? 'SELFTEST PASS' : 'SELFTEST FAIL');
     process.exit(ok ? 0 : 1);
   }

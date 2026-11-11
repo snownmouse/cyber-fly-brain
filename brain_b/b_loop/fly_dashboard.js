@@ -21,11 +21,17 @@
 //   右下 1/4：数据汇报（行为状态/逃逸强度/转向/振翅 + 最活跃组）
 //   左下 1/4：脑区神经图（9 大功能区，按发放率上色，激活时发光）
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 const DIR = __dirname;
 const HTTP_PORT = +(process.env.FLY_DASH_HTTP || 8080);
 const BRAIN_API = process.env.FLY_BRAIN_API || 'http://127.0.0.1:33338/api';
 const DIAG_API = process.env.FLY_DIAG_API || 'http://127.0.0.1:33340/api';
+// 看板轮询间隔：默认 300 ms（与原本完全一致）；云端多项目共存时可设 1000 降约 2/3 开销。
+const POLL_MS = +(process.env.FLY_DASH_POLL_MS || 300);
+// 感官面板独立成文件，服务端拼进同一个 <script>：页面仍是单文件，浏览器不多发请求。
+const SENSE_PANEL = fs.readFileSync(path.join(DIR, 'sense_panel.js'), 'utf8');
 
 // ---- 取 JSON（带超时，错误返回 null，绝不抛异常） ----
 function getJSON(url) {
@@ -53,8 +59,17 @@ async function loopDiag() {
   lastDiag = await getJSON(DIAG_API);
 }
 loopBrain(); loopDiag();
-setInterval(loopBrain, 300);
-setInterval(loopDiag, 300);
+setInterval(loopBrain, POLL_MS);
+setInterval(loopDiag, POLL_MS);
+
+
+// ---- 脑解剖示意图（服务端生成，直接内联进 HTML）------------------------------
+// 放在服务端生成而不是浏览器端，是为了「首屏即有图」：页面还没拿到 /api 时
+// 也能看到完整的脑结构，之后 paintBrain() 只改 fill / stroke / 文本，不再动结构。
+// 真正的绘制逻辑在 brain_svg.js —— 抽成独立模块是为了让本地预览脚本和线上服务
+// 跑同一份代码（否则两边很容易画得不一样）。
+const { brainSvg } = require('./brain_svg');
+const BRAIN_SVG = brainSvg();
 
 // ---------------------------------------------------------------- 页面（内联生成）
 const PAGE = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
@@ -81,6 +96,25 @@ const PAGE = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
   + '.sb{display:flex;gap:5px;margin-bottom:9px;flex-wrap:wrap}'
   + 'button{background:#1e2942;color:#dfe6f5;border:1px solid #26304a;border-radius:5px;padding:4px 9px;font-size:11.5px;cursor:pointer}'
   + 'button.on{background:#1d4a2f;border-color:#2a7a48}'
+  + '#brainfig{margin-bottom:10px}'
+  + '#brainfig svg{display:block;width:100%;height:auto;max-height:none;background:#0d1220;border:1px solid #26304a;border-radius:8px}'
+  + '#brainfig .rn{font-size:9.5px;font-weight:700;fill:#c8d4ea;pointer-events:none}'
+  + '#brainfig .rv{font-size:11px;font-weight:700;font-variant-numeric:tabular-nums;pointer-events:none}'
+  + '#brainfig .rz{font-size:9px;fill:#6b7a99;pointer-events:none}'
+  + '#drive{margin:0 0 10px}'
+  + '#drive table{font-size:11px}'
+  + '#drive th{text-align:left;color:#6b7a99;font-weight:600;padding:3px 10px 3px 0;border-bottom:1px solid #26304a}'
+  + '#drive td{padding:3px 10px 3px 0;border-bottom:1px solid #161d31}'
+  + '#drive .src{color:#dfe6f5;font-weight:600}'
+  + '#drive .na{color:#3a4763}'
+  + '#drive .na2{color:#8595b5;font-size:11.5px;margin-bottom:10px}'
+  + '#anat{margin:0 0 10px}'
+  + '#anat table{font-size:11px;width:100%}'
+  + '#anat th{text-align:left;color:#6b7a99;font-weight:600;padding:3px 10px 3px 0;border-bottom:1px solid #26304a}'
+  + '#anat td{padding:3px 10px 3px 0;border-bottom:1px solid #161d31;vertical-align:top}'
+  + '#anat .src{color:#dfe6f5;font-weight:600;white-space:nowrap}'
+  + '#anat .na{color:#5d6c8c;font-size:10.5px}'
+  + '#anat .v{font-variant-numeric:tabular-nums;white-space:nowrap}'
   + '#brainmap{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px}'
   + '.rg{background:#161d31;border:1px solid #26304a;border-radius:6px;padding:7px 8px;position:relative;overflow:hidden}'
   + '.rg .nm{font-size:12px;font-weight:700;display:flex;justify-content:space-between;align-items:baseline}'
@@ -108,7 +142,17 @@ const PAGE = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
   + '<span style="color:#8595b5;font-size:11px">放歌时看「神经 act / 逃逸」最容易看清反应</span></div>'
   + '<div id="cards" class="g"></div>'
   + '<h2>曲线（最近 12 秒）</h2><svg id="ch" viewBox="0 0 960 200" preserveAspectRatio="none"></svg>'
-  + '<h2>★ 神经元活跃度 · 脑区图（9 大功能区，激活时发光）</h2>'
+  + '<h2>★ 果蝇脑 · 神经元群与神经纤维（俯视）</h2>'
+  + '<div style="color:#8595b5;font-size:12px;line-height:1.7;margin:4px 0 8px">'
+  + '每一块 = 一个<b style="color:#ffd166">真实解剖分区</b>（FlyWire v783 super_class），'
+  + '块面积 ∝ 该区在本子回路里的真实神经元数，<b style="color:#ffd166">左右半脑分开上色</b>。'
+  + '它一放电，那一块的分区底色、神经元点、纤维会一起亮起来 —— 亮度 = 该侧当前发放率。'
+  + '<br>下面的通道条是<b>另一套口径</b>：按我们的输入把 38 个组聚成 9 条感觉/行为通道。'
+  + '两张表要一起看 —— <b style="color:#5fd97e">解剖图回答「哪块脑域在处理」，通道条回答「哪路传感器在灌数据」</b>。'
+  + '注意发亮不等于被驱动：网络本身有自发基线（实测切断驱动后 OLFA 仍有约 22 Hz）。</div>'
+  + '<div id="brainfig">' + BRAIN_SVG + '</div>'
+  + '<div id="drive"></div>'
+  + '<div id="anat"></div>'
   + '<div id="brainmap"></div>'
   + '<div class="lgd"><s style="background:#1e2942"></s>静息<s style="background:#2f6fb8"></s>轻微'
   + '<s style="background:#59c2ff"></s>活跃<s style="background:#ffd166"></s>强'
@@ -130,7 +174,41 @@ const PAGE = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
   + 'function n(x,d){return (x==null||isNaN(+x))?\'—\':(+x).toFixed(d==null?2:d);}'
   + 'function bar(v,c){return \'<div class="b"><i style="width:\'+(Math.max(0,Math.min(1,v||0))*100).toFixed(1)+\'%;background:\'+c+\'"></i></div>\';}'
   + 'function card(k,v,bv,c){return \'<div class="c"><div class="k">\'+k+\'</div><div class="v">\'+v+\'</div>\'+(bv===undefined?\'\':bar(bv,c||\'#59c2ff\'))+\'</div>\';}'
-  + 'function hzC(h){return h>=60?\'#ff6b6b\':h>=30?\'#ffd166\':h>=10?\'#59c2ff\':h>=2?\'#2f6fb8\':\'#1e2942\';}'
+  // 色阶按【实测动态范围】标定：网络自发基线约 10–30 Hz，被驱动的脑区 30–60 Hz，
+  // 听觉/机械感这类硬通道能到 110–190 Hz。旧阈值(60/30/10)是按 0–80 拍的，
+  // 真实数据一进来就全红，等于没有区分度。
+  + 'function hzC(h){return h>=100?\'#ff6b6b\':h>=45?\'#ffd166\':h>=15?\'#59c2ff\':h>=3?\'#2f6fb8\':\'#1e2942\';}'
+  + 'const VIS_MAX=180;'
+  // ---- 脑区上色：按【真实解剖分区 + 左右半脑】取发放率 ----------------------
+  // 数据来自 /api 的 anatomy（super_class 聚合），每块有 hzL / hzR / hz。
+  // 图的骨架是 brain_svg.js 在服务端生成的，这里一个字都不改结构，只改颜色和文字。
+  + 'function paintBrain(at){'
+  + ' if(!at||!at.length)return;'
+  + ' const map={};for(const a of at)map[a.id]=a;'
+  + ' for(const g of document.querySelectorAll("[data-k]")){'
+  + '  const a=map[g.dataset.k];if(!a)continue;'
+  + '  const sd=g.dataset.s||"";'
+  + '  const hz=sd==="L"?(a.hzL||0):sd==="R"?(a.hzR||0):(a.hz||0);'
+  + '  const nz=Math.min(1,hz/VIS_MAX),k=Math.pow(nz,1.4),c=hzC(hz);'
+  // 分区本体：跟着发放率整体变色 + 变亮（这是"哪块脑域在受处理"的主视觉）
+  + '  for(const e of g.querySelectorAll(".rf")){'
+  + '   e.style.fill=c;e.style.fillOpacity=(.18+k*.62).toFixed(2);}'
+  + '  for(const e of g.querySelectorAll(".nd")){'
+  + '   e.style.fill=c;e.style.fillOpacity=(.20+k*.75).toFixed(2);}'
+  + '  for(const e of g.querySelectorAll(".fb")){'
+  + '   e.style.stroke=c;e.style.strokeOpacity=(.06+Math.pow(nz,.7)*.55).toFixed(2);}'
+  + '  for(const e of g.querySelectorAll(".halo")){'
+  + '   e.style.fill=c;e.style.fillOpacity=Math.min(.28,k*.28).toFixed(2);}'
+  + ' }'
+  // 标签：一份数据可能对应左右两个 <text>，用 data-s 区分
+  + ' for(const lb of document.querySelectorAll("[data-lb]")){'
+  + '  const a=map[lb.dataset.lb];if(!a)continue;'
+  + '  const sd=lb.dataset.s||"";'
+  + '  const hz=sd==="L"?(a.hzL||0):sd==="R"?(a.hzR||0):(a.hz||0);'
+  + '  lb.textContent=a.label+" "+(hz>=10?hz.toFixed(0):hz.toFixed(1));'
+  + '  lb.style.fill=hz>=8?"#ffffff":"#8b9abd";'
+  + ' }'
+  + '}'
   + 'function draw(sr){'
   + ' const W=960,H=200,p=22,all=sr.flat().filter(Number.isFinite);'
   + ' if(all.length<2){$(\'ch\').innerHTML=\'\';return;}'
@@ -150,7 +228,7 @@ const PAGE = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
   + 'function flagsText(f){const m=[\'逃逸\',\'左转\',\'右转\',\'梳理\'];let a=[];for(let i=0;i<4;i++)if(f&(1<<i))a.push(m[i]);return a.length?a.join(\' \'):\'静息（无行为）\';}'
   + 'async function tick(){'
   + ' try{'
-  + '  const s=await (await fetch(\'/api\')).json();S=s;'
+  + '  const s=await (await fetch(\'/api\')).json();S=s;window.__FLY_S=s;'
   + '  const c=s.cmd||{};'
   + '  const rs=(s.regions||[]).slice().sort((a,b)=>b.hz-a.hz);'
   + '  const maxHz=rs.length?rs[0].hz:0;'
@@ -165,7 +243,7 @@ const PAGE = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
   + '  $(\'sub\').textContent=\'MAPV=\'+(s.gates?s.gates.MAPV:\'—\')+\' ｜ 已处理 \'+(s.processed==null?\'—\':s.processed)+\' 帧 ｜ 脑静息 \'+(s.brainDead==null?\'—\':(+s.brainDead).toFixed(0))+\'%\';'
   + '  const hasAud=s.audio!=null;'
   + '  $(\'cards\').innerHTML='
-  + '   card(\'神经活动\',n(maxHz,1)+\' Hz\',Math.min(1,maxHz/80))'
+  + '   card(\'神经活动\',n(maxHz,1)+\' Hz\',Math.min(1,maxHz/VIS_MAX))'
   + '  +card(\'听觉 aud\',n(s.audio),hasAud?s.audio:undefined)'
   + '  +card(\'梳理 jo\',n(s.jo),hasAud?s.jo:undefined,\'#ffd166\')'
   + '  +card(\'侧向 lat\',n(s.lat),hasAud?s.lat:undefined,\'#ff9f45\')'
@@ -182,25 +260,52 @@ const PAGE = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
   + '  draw([CH[cur].h()]);'
   + '  const bflags2=(c.flags||0); const flagLit=(k)=>{if(k===\'escape\')return bflags2&1;if(k===\'steer\')return bflags2&(2|4);if(k===\'groom\')return bflags2&8;if(k===\'feed\')return bflags2&16;return false;};'
   + '  let r=\'\';'
-  + '  for(const g of rs){const lit=g.hz>=2||flagLit(g.key);'
-  + '   r+=\'<div class="rg\'+(lit?\' act\':\'\')+\'"><div class="nm"><span>\'+g.label+\'</span><span class="hz">\'+g.hz.toFixed(1)+\' Hz</span></div>\''
+  + '  for(const g of rs){const blind=g.wired===false;const lit=!blind&&(g.hz>=2||flagLit(g.key));'
+  + '   r+=\'<div class="rg\'+(lit?\' act\':\'\')+\'"\'+(blind?\' style="opacity:.6"\':\'\')+\'><div class="nm"><span>\'+g.label+\'</span><span class="hz">\'+(blind?\'未接入\':g.hz.toFixed(1)+\' Hz\')+\'</span></div>\''
   + '    +\'<div class="hint">\'+g.hint+\'</div>\''
-  + '    +\'<div class="fill" style="width:\'+Math.min(100,g.hz/80*100).toFixed(0)+\'%;background:\'+hzC(g.hz)+\'"></div></div>\';}'
+  + '    +(blind?\'<div class="fill" style="width:100%;background:#1a2136"></div>\':\'<div class="fill" style="width:\'+Math.min(100,g.hz/VIS_MAX*100).toFixed(0)+\'%;background:\'+hzC(g.hz)+\'"></div>\')+\'</div>\';}'
   + '  $(\'brainmap\').innerHTML=r;'
+  + '  paintBrain(s.anatomy||[]);'
+  + '  const dr=s.senseDrive||{};const dk=Object.keys(dr);'
+  + '  let dh="<h3>传感器 → 脑区 实时映射</h3><table><tr><th>传感器</th><th>原值</th><th>归一化</th><th>注入发放率</th><th>靶组神经元</th></tr>";'
+  + '  for(const k of dk){const d=dr[k];const na=(d.mapped===false);'
+  + '   dh+="<tr><td class=src>"+d.src+"</td><td>"+(d.raw==null?"<span class=na>无数据</span>":d.raw+" "+d.unit)+"</td><td>"+(na?"—":(d.norm*100).toFixed(0)+"%")+"</td><td class=v>"+(na?"0 Hz":d.hz.toFixed(1)+" Hz")+"</td><td>"+d.neurons+" 个</td></tr>";}'
+  + '  dh+="</table>";'
+  // 三种状态必须分开，别混成一句"未启用"：
+  //   ① 配置里就没有直连（FLY_SENSE_PORT=0 / 路数为 0）  ② 配了但还没收到 40 B 帧  ③ 有数据
+  + '  if(!dk.length) dh=(s.sense&&s.sense.routes)>0'
+  + '   ?"<div class=na2>感官直连已启用（"+s.sense.routes+" 路），但还没收到 40 B 感官帧 —— 板子未上电或未连上云端；此期间只有 arousal 调制生效。</div>"'
+  + '   :"<div class=na2>感官直连未启用（大脑侧 FLY_SENSE_PORT=0 或这几路都没命中子回路），当前只有 arousal 调制。</div>";'
+  + '  $("drive").innerHTML=dh;'
+  // 解剖分区明细：真实计数 + 左右分别的发放率 + 主要细胞类型（可对数核对）
+  + '  const an=(s.anatomy||[]).slice().sort((x,y)=>y.n-x.n);'
+  + '  let ah="<h3>解剖分区明细（FlyWire v783 super_class · 面积 ∝ 神经元数）</h3>'
+      +'<table><tr><th>分区</th><th>神经元</th><th>左 / 右</th><th>当前发放率（L · R）</th><th>主要细胞类型</th></tr>";'
+  + '  for(const a of an){'
+  + '   ah+="<tr><td class=src>"+a.label+"</td><td class=v>"+a.n+"</td><td class=na>"+a.nL+" / "+a.nR+"</td>'
+      +'<td class=v>"+a.hz.toFixed(1)+" Hz <span class=na>L "+(a.hzL==null?"—":a.hzL.toFixed(1))+" · R "+(a.hzR==null?"—":a.hzR.toFixed(1))+"</span></td>'
+      +'<td class=na>"+a.top.map(t=>t.t+" "+t.n).join(" · ")+"</td></tr>";}'
+  + '  ah+="</table>";'
+  + '  if(!an.length) ah="<div class=na2>解剖分区未上报（大脑侧 buildAnatomy 没跑，确认子回路 JSON 带 supers 字段）</div>";'
+  + '  $("anat").innerHTML=ah;'
   + '  const gs=(s.groups||[]).slice().sort((a,b)=>b.hz-a.hz);'
+  + '  const st=s.steer||{};'
+  + '  const sth=st.src?(\'<span style="font-size:11px;color:#6b7a99">\'+st.src+\'</span>\'):\'\';'
   + '  $(\'rep\').innerHTML='
   + '   \'<div class="c">行为状态<span class="v">\'+flagsText(c.flags||0)+\'</span></div>\''
   + '  +\'<div class="c">逃逸强度<span class="v">\'+n(c.arousal,1)+\'</span></div>\''
-  + '  +\'<div class="c">转向<span class="v">\'+n(c.turn,2)+\'</span></div>\''
+  + '  +\'<div class="c">转向<span class="v">\'+n(c.turn,2)+\'</span>\'+sth+\'</div>\''
   + '  +\'<div class="c">振翅<span class="v">\'+((c.motor||0)?\'开\':\'关\')+\'</span></div>\''
   + '  +gs.slice(0,8).map(g=>\'<div class="row"><span class="nm2">\'+g.base+(g.side?\'·\'+g.side:\'\')+\'</span><span class="v">\'+g.hz.toFixed(1)+\' Hz</span></div>\').join(\'\');'
   + '  let t=\'\';'
   + '  for(const g of gs){'
-  + '   t+=\'<tr><td class="nm2">\'+g.base+(g.side?\'<span style="color:#6b7a99">·\'+g.side+\'</span>\':\'\')+\'</td>\''
-  + '    +\'<td class="v">\'+g.hz.toFixed(1)+\' Hz</td>\''
-  + '    +\'<td style="width:160px">\'+bar(Math.min(1,g.hz/80),hzC(g.hz))+\'</td>\''
+  + '   const blind=g.wired===false;'
+  + '   t+=\'<tr\'+(blind?\' style="opacity:.55"\':\'\')+\'><td class="nm2">\'+g.base+(g.side?\'<span style="color:#6b7a99">·\'+g.side+\'</span>\':\'\')+\'</td>\''
+  + '    +\'<td style="color:#6b7a99;font-size:12px">\'+(g.nerve||\'\')+(blind?\' <span style="color:#ff9f45">未接</span>\':\'\')+\'</td>\''
+  + '    +\'<td class="v">\'+(blind?\'—\':g.hz.toFixed(1)+\' Hz\')+\'</td>\''
+  + '    +\'<td style="width:160px">\'+(blind?\'<span style="color:#3a4763;font-size:11px">等待传感器</span>\':bar(Math.min(1,g.hz/VIS_MAX),hzC(g.hz)))+\'</td>\''
   + '    +\'<td style="color:#6b7a99">\'+g.n+\' 个</td></tr>\';}'
-  + '  $(\'neu\').innerHTML=t||\'<tr><td colspan="4" style="color:#8595b5">\'+(s.brainOk?\'等待脑侧数据…\':\'脑侧未连上——检查大脑的 --api 是否开启\')+\'</td></tr>\';'
+  + '  $(\'neu\').innerHTML=t||\'<tr><td colspan="5" style="color:#8595b5">\'+(s.brainOk?\'等待脑侧数据…\':\'脑侧未连上——检查大脑的 --api 是否开启\')+\'</td></tr>\';'
   + '  const R=s.rms,L=s.low,M=s.mid,Hh=s.high,AX=(s.accel&&s.accel[0]);'
   + '  $(\'feat\').innerHTML='
   + '   \'<tr><td>总 RMS</td><td class="v">\'+(R==null?\'—\':R.toFixed(1))+\' dBFS</td><td>云端映射的输入，饱和说明门限太低</td></tr>\''
@@ -212,9 +317,23 @@ const PAGE = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
   + ' setTimeout(tick,500);'
   + '}'
   + 'tick();'
+  + SENSE_PANEL
   + '</script></body></html>';
 
 http.createServer((req, res) => {
+  // 感官调参代理：页面 -> 看板 -> 大脑 --api（大脑侧默认关闭，见 FLY_SENSE_TUNE）。
+  const gm = /^\/sense\?gain=(0(?:\.\d+)?|1(?:\.0+)?)$/.exec(req.url || '');
+  if (gm) {
+    const target = BRAIN_API.replace(/\/api.*$/, '') + '/api/sense?gain=' + gm[1];
+    const rq = http.get(target, { timeout: 2000 }, (rs) => {
+      let b = ''; rs.setEncoding('utf8');
+      rs.on('data', (c) => { b += c; });
+      rs.on('end', () => { res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(b || '{"ok":false}'); });
+    });
+    rq.on('error', () => { res.writeHead(502); res.end('{"ok":false}'); });
+    rq.on('timeout', () => { rq.destroy(); res.writeHead(502); res.end('{"ok":false}'); });
+    return;
+  }
   if (req.url === '/api' || req.url.startsWith('/api?')) {
     res.writeHead(200, {
       'Content-Type': 'application/json; charset=utf-8',

@@ -168,6 +168,18 @@ function ch(k,b){cur=k;['bA','bE','bL','bJ'].forEach(i=>$(i).className='');b.cla
 function bar(v,c){return '<div class="b"><i style="width:'+(Math.max(0,Math.min(1,v))*100).toFixed(1)+'%;background:'+c+'"></i></div>';}
 function card(k,v,bv,c){return '<div class="c"><div class="k">'+k+'</div><div class="v">'+v+'</div>'+(bv===undefined?'':bar(bv,c||'#59c2ff'))+'</div>';}
 function hzC(h){return h>=60?'#ff6b6b':h>=30?'#ffd166':h>=10?'#59c2ff':h>=2?'#2f6fb8':'#1e2942';}
+// 每一组神经元"感觉来源 / 是否已接线"。0=未接入 1=已接入 2=运动输出（派生，不占感觉位）。
+// 这张表的用途：让「盲蝇」这件事在页面上是显式的，而不是一片 0 Hz 看着像坏了。
+const SRC={
+ LC4:['视觉',0], LPLC2:['视觉',0], LC16:['视觉',0],
+ OLFA:['嗅觉',0], OLFR:['嗅觉',0],
+ SUGAR:['味觉',0], BITTER:['味觉',0],
+ THERMO:['温湿度',0], HYGRO:['温湿度',0],
+ AUDIO:['听觉',1], JO:['机械感',1], TOUCH:['触觉',1],
+ ISN:['内部',0],
+ DNa01:['运动输出',2], DNa02:['运动输出',2], DNp01:['运动输出',2],
+ MN9:['运动输出',2], aDN1:['运动输出',2], MDN:['运动输出',2]
+};
 function draw(sr){
  const W=960,H=190,p=22,all=sr.flat().filter(Number.isFinite);
  if(all.length<2){$('ch').innerHTML='';return;}
@@ -209,12 +221,16 @@ async function tick(){
   const gs=(s.groups||[]).slice().sort((a,b)=>b.hz-a.hz);
   let r='';
   for(const g of gs){
-   r+='<tr><td class="nm">'+g.base+(g.side?'<span style="color:#6b7a99">·'+g.side+'</span>':'')+'</td>'
-    +'<td class="v">'+g.hz.toFixed(1)+' Hz</td>'
-    +'<td style="width:170px">'+bar(Math.min(1,g.hz/80),hzC(g.hz))+'</td>'
+   const st=SRC[g.base]||['其它',0];
+   const wired=st[1]===1, isOut=st[1]===2;
+   const blind=!wired&&!isOut;
+   r+='<tr'+(blind?' style="opacity:.55"':'')+'><td class="nm">'+g.base+(g.side?'<span style="color:#6b7a99">·'+g.side+'</span>':'')+'</td>'
+    +'<td style="color:#6b7a99;font-size:12px">'+st[0]+(blind?' <span style="color:#ff9f45">未接</span>':'')+'</td>'
+    +'<td class="v">'+(blind?'—':g.hz.toFixed(1)+' Hz')+'</td>'
+    +'<td style="width:170px">'+(blind?'<span style="color:#3a4763;font-size:11px">等待传感器接入</span>':bar(Math.min(1,g.hz/80),hzC(g.hz)))+'</td>'
     +'<td style="color:#6b7a99">'+g.n+' 个</td></tr>';
   }
-  $('neu').innerHTML=r||'<tr><td colspan="4" style="color:#8595b5">'+(s.brainOk?'等待脑侧数据…':'脑侧未连上——检查大脑的 --api 是否开启')+'</td></tr>';
+  $('neu').innerHTML=r||'<tr><td colspan="5" style="color:#8595b5">'+(s.brainOk?'等待脑侧数据…':'脑侧未连上——检查大脑的 --api 是否开启')+'</td></tr>';
   $('feat').innerHTML=
    '<tr><td>总 RMS</td><td class="v">'+s.rms.toFixed(1)+' dBFS</td><td>云端映射的输入，饱和说明门限太低</td></tr>'
   +'<tr><td>低频 50-150 Hz</td><td class="v">'+s.low.toFixed(1)+' dBFS</td><td>JO-B 类神经元</td></tr>'
@@ -240,7 +256,12 @@ const PAGE = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
   + '<div id="vd" class="vd muted">连接中…</div><div id="dt" class="dt"></div>'
   + '<div id="cards" class="g"></div>'
   + '<h2>曲线（最近 12 秒）</h2><svg id="ch" viewBox="0 0 960 190" preserveAspectRatio="none"></svg>'
-  + '<h2>★ 神经元活跃度（38 组，每 250 ms 采样，按发放率排序）</h2>'
+  + '<h2>★ 神经元活跃度（38 组，按发放率排序）</h2>'
+  + '<div style="color:#8595b5;font-size:12px;line-height:1.7;margin:4px 0 8px">'
+  + '当前为 <b style="color:#ffd166">盲蝇模式</b>：只接了听觉（麦克风）、机械感、触觉三路。'
+  + '视觉 3 组 / 嗅觉 2 组 / 味觉 2 组 / 温湿度 2 组<b>还没有传感器</b>，标「未接」的那几行静息是设定，不是故障。<br>'
+  + '马达输出 6 组（DNp01·MDN·MN9·aDN1·DNa01·DNa02）是<b>结果</b>不是输入，它们的 Hz 才是真正在驱动行为的量。'
+  + '</div>'
   + '<div class="lg"><s style="background:#1e2942"></s>静息<s style="background:#2f6fb8"></s>轻微'
   + '<s style="background:#59c2ff"></s>活跃<s style="background:#ffd166"></s>强'
   + '<s style="background:#ff6b6b"></s>最强</div>'
