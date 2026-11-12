@@ -68,14 +68,15 @@
     }
     var v = s.valid || 0, on = !!s.online;
     var stale0 = s.staleMs == null ? 2500 : s.staleMs;
-    var age0 = s.at == null ? null : Math.max(0, Date.now() - s.at);
-    // 关键：online 只表示"曾经收到过"，不代表"现在还在来"。
-    // 板子拔掉 / relay 停了之后 online 仍为 true，会让面板一直报"在线"却没有任何新数据。
-    var fresh = on && age0 != null && age0 <= stale0;
+    // ★ 年龄一律用【服务器算好的 ageMs】。以前是 Date.now() − s.at，而 s.at 是服务器时钟，
+    //   本机与服务器差几秒就会把"刚到的帧"显示成"已过期 5.3 s"，白吓一场。
+    var ageMs = (typeof s.ageMs === 'number') ? s.ageMs
+             : (s.at == null ? null : Math.max(0, Date.now() - s.at));
+    var fresh = on && ageMs != null && ageMs <= stale0;
     var h = '';
     h += fresh
       ? row('连接', '在线 · 2 Hz', true)
-      : row('连接', on ? ('帧已过期 ' + num(age0 / 1000, 1, ' s')) : '等待感官帧', false);
+      : row('连接', on ? ('帧已过期 ' + num(ageMs / 1000, 1, ' s')) : '等待感官帧', false);
     h += row('温度', (v & 1) ? num(s.tempC, 1, ' ℃') : '—', !!(v & 1));
     h += row('湿度', (v & 1) ? num(s.rh, 1, ' %RH') : '—', !!(v & 1));
     h += row('光照', (v & 2) ? num(s.lux, 0, ' lx') : '—', !!(v & 2));
@@ -86,9 +87,8 @@
     h += row('脊髓事件', (EV[s.event] || ('码 ' + s.event)) + (s.event ? '' : ''), s.event ? true : null);
     h += row('有效位', '0x' + (v >>> 0).toString(16).toUpperCase().padStart(2, '0'), null);
     h += row('帧 / 坏帧', (s.frames == null ? '—' : s.frames) + ' / ' + (s.rejects == null ? '—' : s.rejects), null);
-    var age = s.at == null ? null : Math.max(0, (Date.now() - s.at) / 1000);
     var stale = s.staleMs == null ? 2500 : s.staleMs;
-    h += row('数据年龄', age == null ? '—' : num(age, 1, ' s'), age == null ? null : (age * 1000 < stale));
+    h += row('数据年龄', ageMs == null ? '—' : num(ageMs / 1000, 1, ' s'), ageMs == null ? null : (ageMs < stale));
     $('spRows').innerHTML = h;
 
     var aro = (s.arousal == null ? 0 : +s.arousal) / 255;
