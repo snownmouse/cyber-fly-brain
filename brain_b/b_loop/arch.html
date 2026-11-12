@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cyber-Fly · 体系说明（传感器 → ESP32 → 云端大脑）</title>
+<style>
+  :root{
+    --bg:#0b0f1a; --panel:#101728; --card:#161d31; --line:#26304a;
+    --tx:#dfe6f5; --mut:#8595b5; --dim:#6b7a99;
+    --blue:#59c2ff; --warm:#ffd166; --green:#5fd97e; --red:#ff6b6b; --purple:#b98cff;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--tx);margin:0;
+       font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;line-height:1.75}
+  .wrap{max-width:1240px;margin:0 auto;padding:22px 22px 60px}
+  h1{font-size:24px;margin:0 0 6px}
+  h2{font-size:16px;margin:34px 0 10px;padding-left:10px;border-left:3px solid var(--blue)}
+  h3{font-size:13.5px;color:var(--mut);margin:18px 0 6px;font-weight:600;letter-spacing:.4px}
+  p{color:#b9c4da;margin:8px 0}
+  .sub{color:var(--mut);font-size:12.5px;margin-bottom:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:12px 0}
+  .diag{background:#0d1220;border:1px solid var(--line);border-radius:10px;padding:10px;overflow:auto}
+  .diag svg{display:block;width:100%;height:auto;min-width:920px}
+  table{border-collapse:collapse;width:100%;font-size:12.5px}
+  th{text-align:left;color:var(--dim);font-weight:600;padding:6px 10px 6px 0;border-bottom:1px solid var(--line);white-space:nowrap}
+  td{padding:6px 10px 6px 0;border-bottom:1px solid #1a2237;vertical-align:top;color:#c2ccdf}
+  td.k{color:var(--tx);font-weight:600;white-space:nowrap}
+  .num{font-variant-numeric:tabular-nums}
+  code{background:#1b2338;border:1px solid #26304a;border-radius:4px;padding:1px 5px;font-size:11.5px;color:#a8d4ff}
+  .tag{display:inline-block;font-size:10.5px;padding:1px 7px;border-radius:999px;margin-right:6px;
+       border:1px solid var(--line);color:var(--mut);background:#1a2136}
+  .t-slow{border-color:#3d5a2a;color:#a8e06b;background:#1a2415}
+  .t-fast{border-color:#2a4a6d;color:#7fc4ff;background:#111e2c}
+  .t-down{border-color:#6b2f3a;color:#ff9aa8;background:#241318}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+  .box{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:13px 15px}
+  .box .h{font-size:13px;font-weight:700;color:var(--tx);margin-bottom:6px}
+  .box .b{font-size:12.5px;color:#a9b6d0}
+  .kv{display:flex;justify-content:space-between;gap:10px;font-size:12.5px;padding:3px 0;border-bottom:1px solid #1a2237}
+  .kv:last-child{border-bottom:0}
+  .kv span:first-child{color:var(--mut)}
+  .kv span:last-child{font-variant-numeric:tabular-nums;font-weight:600}
+  .warn{border-left:3px solid var(--warm);background:#1d1a10;padding:10px 14px;border-radius:0 8px 8px 0;margin:12px 0;font-size:12.5px;color:#e8d9b0}
+  .ok{color:var(--green)} .no{color:var(--red)} .mu{color:var(--dim)}
+  a{color:var(--blue);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .flow{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#9fb2d4;background:#0d1220;
+        border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow:auto;white-space:pre;line-height:1.85}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Cyber-Fly · 体系说明</h1>
+  <div class="sub">
+    一个"用真果蝇连接组当大脑"的机器：板端只管感觉与动作，<b>想干什么由云端的 6296 个神经元决定</b>。
+    &nbsp;｜&nbsp; <a href="/">← 回到实时看板</a>
+  </div>
+
+  <!-- ============================================================ 1. 总逻辑图 -->
+  <h2>一、总逻辑图（一张图看完整个体系）</h2>
+  <div class="diag">
+    <svg viewBox="0 0 1180 706" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="#59c2ff"/>
+        </marker>
+        <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="#ffd166"/>
+        </marker>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="#ff6b6b"/>
+        </marker>
+      </defs>
+
+      <!-- 分区底色 -->
+      <rect x="18" y="26" width="262" height="654" rx="12" fill="#111827" fill-opacity=".55" stroke="#26304a"/>
+      <text x="34" y="50" fill="#8595b5" font-size="13" font-weight="700">① 传感器端（面包板）</text>
+      <text x="34" y="68" fill="#5d6c8c" font-size="11">7 个器件 · 8 个物理量</text>
+
+      <rect x="312" y="26" width="300" height="654" rx="12" fill="#111827" fill-opacity=".55" stroke="#26304a"/>
+      <text x="328" y="50" fill="#8595b5" font-size="13" font-weight="700">② ESP32-S3（脊髓 / 脑干）</text>
+      <text x="328" y="68" fill="#5d6c8c" font-size="11">只负责采样、打包、发出去、把动作演出来</text>
+
+      <rect x="644" y="26" width="518" height="654" rx="12" fill="#111827" fill-opacity=".55" stroke="#26304a"/>
+      <text x="660" y="50" fill="#8595b5" font-size="13" font-weight="700">③ 腾讯云轻量服务器（大脑 + 中继 + 看板）</text>
+      <text x="660" y="68" fill="#5d6c8c" font-size="11">115.159.148.236 · Debian 12 · 3 个 systemd 服务常驻</text>
+
+      <!-- ===== 传感器列 ===== -->
+      <!-- 1 -->
+      <rect x="34" y="86" width="230" height="56" rx="8" fill="#1a2438" stroke="#3a4a6b"/>
+      <text x="46" y="107" fill="#dfe6f5" font-size="12.5" font-weight="700">AHT10　温湿度</text>
+      <text x="46" y="125" fill="#8595b5" font-size="10">I²C 0x38 · −40~85 ℃ / 0~100 %RH</text>
+      <!-- 2 -->
+      <rect x="34" y="152" width="230" height="56" rx="8" fill="#1a2438" stroke="#3a4a6b"/>
+      <text x="46" y="173" fill="#dfe6f5" font-size="12.5" font-weight="700">BH1750　光照</text>
+      <text x="46" y="191" fill="#8595b5" font-size="10">I²C 0x23 · 1~65535 lx（复眼亮度）</text>
+      <!-- 3 -->
+      <rect x="34" y="218" width="230" height="56" rx="8" fill="#1a2438" stroke="#3a4a6b"/>
+      <text x="46" y="239" fill="#dfe6f5" font-size="12.5" font-weight="700">SGP40　气体 / VOC</text>
+      <text x="46" y="257" fill="#8595b5" font-size="10">I²C 0x59 · VOC index —— 这就是嗅觉</text>
+      <!-- 4 -->
+      <rect x="34" y="284" width="230" height="56" rx="8" fill="#1a2438" stroke="#3a4a6b"/>
+      <text x="46" y="305" fill="#dfe6f5" font-size="12.5" font-weight="700">VL53L　激光测距</text>
+      <text x="46" y="323" fill="#8595b5" font-size="10">I²C 0x29 · 20~1200 mm（前方障碍）</text>
+      <!-- 5 -->
+      <rect x="34" y="350" width="230" height="56" rx="8" fill="#1a2438" stroke="#3a4a6b"/>
+      <text x="46" y="371" fill="#dfe6f5" font-size="12.5" font-weight="700">摇杆　X / Y</text>
+      <text x="46" y="389" fill="#8595b5" font-size="10">ADC · −1000~1000（人工给方向）</text>
+      <!-- 6 -->
+      <rect x="34" y="422" width="230" height="56" rx="8" fill="#182742" stroke="#2a4a6d"/>
+      <text x="46" y="443" fill="#dfe6f5" font-size="12.5" font-weight="700">BMI270　六轴 IMU</text>
+      <text x="46" y="461" fill="#7fc4ff" font-size="10">I²C 0x69 · 三轴 → 碰触 + 侧向</text>
+      <!-- 7 -->
+      <rect x="34" y="488" width="230" height="56" rx="8" fill="#182742" stroke="#2a4a6d"/>
+      <text x="46" y="509" fill="#dfe6f5" font-size="12.5" font-weight="700">ICS-43434　数字麦克风</text>
+      <text x="46" y="527" fill="#7fc4ff" font-size="10">I²S · 16 kHz → 听觉 / JO</text>
+
+      <text x="34" y="576" fill="#5d6c8c" font-size="11">前 5 个走【慢车道】40 B / 2 Hz；</text>
+      <text x="34" y="594" fill="#5d6c8c" font-size="11">IMU 与麦克风走【快车道】68 B / 20 Hz。</text>
+      <text x="34" y="618" fill="#5d6c8c" font-size="11">慢车道只为"看清环境"，快车道才参与</text>
+      <text x="34" y="636" fill="#5d6c8c" font-size="11">20 Hz 的实时反应。</text>
+      <text x="34" y="652" fill="#5d6c8c" font-size="10.5">4 个 I²C 器件共用一条总线，</text>
+      <text x="34" y="668" fill="#5d6c8c" font-size="10.5">地址 0x23 / 0x29 / 0x38 / 0x59 不冲突。</text>
+
+      <!-- ===== 传感器 → ESP32 的连接 ===== -->
+      <path d="M264 300 H300" stroke="#59c2ff" stroke-width="1.6" fill="none" marker-end="url(#ar)"/>
+      <text x="268" y="290" fill="#7fc4ff" font-size="9">I²C</text>
+      <path d="M264 446 H300" stroke="#59c2ff" stroke-width="1.6" fill="none" marker-end="url(#ar)"/>
+      <path d="M264 512 H300" stroke="#59c2ff" stroke-width="1.6" fill="none" marker-end="url(#ar)"/>
+      <text x="266" y="504" fill="#7fc4ff" font-size="10">I²S</text>
+      <text x="266" y="378" fill="#7fc4ff" font-size="10">ADC</text>
+
+      <!-- ===== ESP32 内部 ===== -->
+      <rect x="330" y="96" width="264" height="120" rx="8" fill="#152238" stroke="#2f6fb8"/>
+      <text x="344" y="118" fill="#dfe6f5" font-size="12.5" font-weight="700">20 Hz 主循环（50 ms 一拍）</text>
+      <text x="344" y="139" fill="#a9b6d0" font-size="11">· 读 IMU 三轴 + 麦克风 RMS/三频段</text>
+      <text x="344" y="157" fill="#a9b6d0" font-size="11">· 打包 68 B MPRB 帧，UDP 发出</text>
+      <text x="344" y="175" fill="#a9b6d0" font-size="11">· 收 32 B MPRC 下行，驱动屏幕精灵</text>
+      <text x="344" y="196" fill="#5fd97e" font-size="10.5">实测脑步 23 ms／帧，链路往返 &lt; 40 ms</text>
+
+      <rect x="330" y="228" width="264" height="104" rx="8" fill="#1a2415" stroke="#3d5a2a"/>
+      <text x="344" y="250" fill="#dfe6f5" font-size="12.5" font-weight="700">2 Hz 慢循环（500 ms 一拍）</text>
+      <text x="344" y="271" fill="#a9b6d0" font-size="11">· 读 AHT10 / BH1750 / SGP40 / VL53 / 摇杆</text>
+      <text x="344" y="289" fill="#a9b6d0" font-size="11">· 打包 40 B MPRS 感官帧</text>
+      <text x="344" y="307" fill="#a9b6d0" font-size="11">· 只上报，不等回包（不参与 20 Hz 闭环）</text>
+
+      <rect x="330" y="344" width="264" height="96" rx="8" fill="#1d1a2e" stroke="#5a4a8a"/>
+      <text x="344" y="366" fill="#dfe6f5" font-size="12.5" font-weight="700">屏幕上的"虫"（执行器）</text>
+      <text x="344" y="387" fill="#a9b6d0" font-size="11">480×320 画布上的 2D 精灵</text>
+      <text x="344" y="405" fill="#a9b6d0" font-size="11">turn / thrust / flags 决定它往哪走</text>
+      <text x="344" y="427" fill="#ff9f45" font-size="10.5">⚠ 开环：它不动传感器读数（见第七节）</text>
+
+      <rect x="330" y="452" width="264" height="88" rx="8" fill="#152238" stroke="#2f6fb8"/>
+      <text x="344" y="474" fill="#dfe6f5" font-size="12.5" font-weight="700">Wi-Fi STA（连手机热点）</text>
+      <text x="344" y="495" fill="#a9b6d0" font-size="11">目标 IP 写死在配置里，不走 DNS</text>
+      <text x="344" y="513" fill="#a9b6d0" font-size="11">（DNS 会让 20 Hz 循环被阻塞）</text>
+      <text x="344" y="532" fill="#5d6c8c" font-size="10.5">上行 UDP 33333 → 云端</text>
+
+      <text x="330" y="580" fill="#5d6c8c" font-size="11">上电顺序：先认板型 → 再开电源 →</text>
+      <text x="330" y="598" fill="#5d6c8c" font-size="11">再初始化外设。顺序错了传感器会假死。</text>
+      <text x="330" y="622" fill="#5d6c8c" font-size="11">中断脚 GPIO2 被 IMU 与双磁力计共用，</text>
+      <text x="330" y="640" fill="#5d6c8c" font-size="11">所以 IMU 走轮询而不是中断。</text>
+
+      <!-- ===== 上行链路 ===== -->
+      <path d="M594 200 L620 200 L620 150 L640 150" stroke="#59c2ff" stroke-width="2" fill="none" marker-end="url(#ar)"/>
+      <path d="M594 300 L620 300 L620 240 L640 240" stroke="#a8e06b" stroke-width="2" fill="none" marker-end="url(#ar)"/>
+      <text x="597" y="126" fill="#7fc4ff" font-size="9.5">68 B ↑</text>
+      <text x="597" y="370" fill="#a8e06b" font-size="9.5">40 B ↑</text>
+
+      <!-- ===== 云端内部 ===== -->
+      <rect x="660" y="96" width="250" height="86" rx="8" fill="#152238" stroke="#2f6fb8"/>
+      <text x="674" y="118" fill="#dfe6f5" font-size="12.5" font-weight="700">relay.js　中继（UDP 33333）</text>
+      <text x="674" y="139" fill="#a9b6d0" font-size="11">· 校验 magic / 长度 / CRC32</text>
+      <text x="674" y="157" fill="#a9b6d0" font-size="11">· 只转给本机大脑，不回公网</text>
+      <text x="674" y="175" fill="#a9b6d0" font-size="11">· 板子身份锁：20 帧才认主</text>
+
+      <rect x="660" y="200" width="250" height="150" rx="8" fill="#1d1a2e" stroke="#5a4a8a"/>
+      <text x="674" y="222" fill="#dfe6f5" font-size="12.5" font-weight="700">stage1_loop.js　大脑</text>
+      <text x="674" y="243" fill="#b98cff" font-size="11.5">6296 个神经元 / 38 个组</text>
+      <text x="674" y="263" fill="#a9b6d0" font-size="11">· 传感器 → 靶组发放率（Hz）</text>
+      <text x="674" y="281" fill="#a9b6d0" font-size="11">· 突触矩阵积分，跑生物时间</text>
+      <text x="674" y="299" fill="#a9b6d0" font-size="11">· 读下行组 → turn / 行为旗</text>
+      <text x="674" y="317" fill="#a9b6d0" font-size="11">· 输出 32 B MPRC 下行帧</text>
+      <text x="674" y="337" fill="#5fd97e" font-size="10.5">见第七节：数据源是 FlyWire 真连接组</text>
+
+      <rect x="660" y="368" width="250" height="86" rx="8" fill="#152238" stroke="#2f6fb8"/>
+      <text x="674" y="390" fill="#dfe6f5" font-size="12.5" font-weight="700">fly_dashboard.js　:8080</text>
+      <text x="674" y="411" fill="#a9b6d0" font-size="11">· 拼页面 + 代理 /api（同源，无 CORS）</text>
+      <text x="674" y="429" fill="#a9b6d0" font-size="11">· 脑区图 / 波形 / 全 38 组</text>
+      <text x="674" y="447" fill="#a9b6d0" font-size="11">· 本页也从这里出：<tspan fill="#7fc4ff">/arch</tspan></text>
+
+      <rect x="660" y="472" width="250" height="72" rx="8" fill="#1a2415" stroke="#3d5a2a"/>
+      <text x="674" y="494" fill="#dfe6f5" font-size="12.5" font-weight="700">数据来源（只读）</text>
+      <text x="674" y="515" fill="#a9b6d0" font-size="11">flywire-fly-lab / subcircuit_v4.json</text>
+      <text x="674" y="533" fill="#5d6c8c" font-size="10.5">6300 万突触里切出的 6296 神经元子图</text>
+
+      <!-- 云端内部箭头 -->
+      <path d="M785 182 V196" stroke="#59c2ff" stroke-width="1.8" fill="none" marker-end="url(#ar)"/>
+      <path d="M690 350 V364" stroke="#ff6b6b" stroke-width="1.8" fill="none" marker-end="url(#arr)"/>
+
+      <!-- ===== 下行回板子 ===== -->
+      <path d="M660 340 L628 340 L628 470 L600 470" stroke="#ff6b6b" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+      <text transform="translate(638,462) rotate(-90)" fill="#ff9aa8" font-size="9">32 B 下行</text>
+      
+
+      <!-- ===== 右侧说明 ===== -->
+      <rect x="936" y="96" width="208" height="446" rx="8" fill="#0d1220" stroke="#26304a"/>
+      <text x="952" y="118" fill="#ffd166" font-size="12" font-weight="700">这一页要看懂的三件事</text>
+      <text x="952" y="146" fill="#c2ccdf" font-size="11">1. 板子不"思考"。</text>
+      <text x="952" y="164" fill="#8595b5" font-size="10.5">它只把感觉变成数字发出去，</text>
+      <text x="952" y="180" fill="#8595b5" font-size="10.5">再把回来的命令演成动作。</text>
+      <text x="952" y="208" fill="#c2ccdf" font-size="11">2. 决定方向的是连接组。</text>
+      <text x="952" y="226" fill="#8595b5" font-size="10.5">视觉 → LC16 左右差 → DNa02</text>
+      <text x="952" y="242" fill="#8595b5" font-size="10.5">→ turn。不是 if-else。</text>
+      <text x="952" y="270" fill="#c2ccdf" font-size="11">3. 两条车道分工。</text>
+      <text x="952" y="288" fill="#8595b5" font-size="10.5">2 Hz 慢车道管"环境好不好"，</text>
+      <text x="952" y="304" fill="#8595b5" font-size="10.5">20 Hz 快车道管"现在要往哪躲"。</text>
+      <line x1="952" y1="326" x2="1128" y2="326" stroke="#26304a"/>
+      <text x="952" y="348" fill="#7fc4ff" font-size="11" font-weight="700">一句话</text>
+      <text x="952" y="368" fill="#a9b6d0" font-size="10.5">传感器 = 感觉器官</text>
+      <text x="952" y="386" fill="#a9b6d0" font-size="10.5">ESP32 = 脊髓 / 脑干</text>
+      <text x="952" y="404" fill="#a9b6d0" font-size="10.5">连接组 = 大脑</text>
+      <text x="952" y="422" fill="#a9b6d0" font-size="10.5">屏幕精灵 = 运动器官</text>
+      <text x="952" y="450" fill="#5d6c8c" font-size="10.5">整条链路的往返延迟</text>
+      <text x="952" y="468" fill="#5fd97e" font-size="11.5" font-weight="700">≈ 40~60 ms</text>
+      <text x="952" y="490" fill="#5d6c8c" font-size="10.5">（人体反射量级）</text>
+    </svg>
+  </div>
+
+  <!-- ============================================================ 2. 三段职责 -->
+  <h2>二、三段职责：谁负责什么</h2>
+  <div class="grid">
+    <div class="box">
+      <div class="h">① 传感器端 · 7 个器件 8 个量</div>
+      <div class="b">
+        负责"感觉"。全部挂在同一条 I²C 总线上（4 个器件 4 个地址，互不冲突），
+        麦克风走 I²S，摇杆走 ADC。<br>
+        它们<b>不认识</b>果蝇，只输出数字：温度、湿度、照度、气体指数、距离、加速度、声压。
+      </div>
+    </div>
+    <div class="box">
+      <div class="h">② ESP32-S3 · 脊髓与脑干</div>
+      <div class="b">
+        负责"采样 + 传输 + 演动作"。20 Hz 主循环和 2 Hz 慢循环各管一条车道。<br>
+        它<b>不做任何决策</b>：没有 if-else 判断"有障碍物就躲"。躲不躲、往哪躲，
+        全看云端回什么。
+      </div>
+    </div>
+    <div class="box">
+      <div class="h">③ 云端 · 大脑</div>
+      <div class="b">
+        6296 个真实神经元、约 38 万条突触，来自 FlyWire 成年果蝇全脑连接组的一个子回路。<br>
+        输入是"哪一组以多少 Hz 放电"，输出是"哪一组在放电"——<b>没有一行规则代码在决定行为</b>。
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================ 3. 三张报文 -->
+  <h2>三、链路上只有三种报文</h2>
+  <p>这三种帧的字节布局都由 C 端（固件）与 JS 端（云端）各自实现一遍，并用<b>同一个黄金帧</b>做交叉校验，任何一边改字段都会立刻对不上。</p>
+  <table>
+    <tr><th>报文</th><th>方向</th><th>长度</th><th>节奏</th><th>装的是什么</th><th>谁在用</th></tr>
+    <tr>
+      <td class="k"><span class="tag t-fast">MPRB 68 B</span></td>
+      <td>板 → 云</td><td class="num">68 B</td><td class="num">20 Hz</td>
+      <td>音频 RMS + 低/中/高三频段（dBFS）、IMU 三轴加速度、seq、发送时间戳</td>
+      <td>驱动听觉 / JO / 触觉 / 侧向四路强度，是实时闭环的唯一输入</td>
+    </tr>
+    <tr>
+      <td class="k"><span class="tag t-slow">MPRS 40 B</span></td>
+      <td>板 → 云</td><td class="num">40 B</td><td class="num">2 Hz</td>
+      <td>温度、湿度、照度、VOC、距离、摇杆 X/Y、有效位图、事件码、arousal</td>
+      <td>驱动温 / 湿 / 嗅觉 / 视觉四路靶组；看板"传感器实况"就显示它</td>
+    </tr>
+    <tr>
+      <td class="k"><span class="tag t-down">MPRC 32 B</span></td>
+      <td>云 → 板</td><td class="num">32 B</td><td class="num">20 Hz</td>
+      <td>turn（−1 左 ~ +1 右）、thrust、motor、flags（逃逸/左转/右转/梳理）、回声时间戳</td>
+      <td>板子照着它动屏幕上的虫；同时用回声算真实往返延迟</td>
+    </tr>
+  </table>
+
+  <div class="warn">
+    <b>为什么慢车道不参与闭环？</b>
+    40 B 感官帧到云端后<b>只解码、只存、只驱动靶组</b>，绝不触发一次大脑步进、也不回下行帧。
+    否则每 500 ms 会多插一个下行帧，把 20 Hz 的节奏打乱——这是踩过的坑。
+  </div>
+
+  <!-- ============================================================ 4. 传感器清单 -->
+  <h2>四、传感器清单：板子上到底有什么、现在读到什么</h2>
+  <p>看板右侧最上方的「感官层 · 面包板 6 路」实时显示的就是下面这张表里的值；
+  主栏的「传感器实况」也会把它们排成一行。灰色 = 该路无效位为 0（没插好或初始化失败）。</p>
+  <table>
+    <tr><th>器件</th><th>接口 / 地址</th><th>量程</th><th>物理意义</th><th>进哪条车道</th><th>驱动哪组神经元</th></tr>
+    <tr><td class="k">AHT10</td><td>I²C 0x38</td><td class="num">−40~85 ℃ / 0~100 %RH</td><td>环境温湿度</td><td><span class="tag t-slow">40 B</span></td><td>THERMO_left/right（29 个）<br>HYGRO_left/right（74 个）</td></tr>
+    <tr><td class="k">BH1750</td><td>I²C 0x23</td><td class="num">1~65535 lx</td><td>整体亮度 ≈ 复眼看到的光强</td><td><span class="tag t-slow">40 B</span></td><td>LC4 / LPLC2 / LC16 左右（465 个）</td></tr>
+    <tr><td class="k">SGP40</td><td>I²C 0x59</td><td class="num">VOC index 0~500</td><td>气体 / 气味浓度 —— <b>这就是嗅觉</b></td><td><span class="tag t-slow">40 B</span></td><td>OLFA / OLFR 左右（106 个）</td></tr>
+    <tr><td class="k">VL53L</td><td>I²C 0x29</td><td class="num">20~1200 mm</td><td>正前方有没有东西、多远</td><td><span class="tag t-slow">40 B</span></td><td class="mu">暂未接入神经网络（只上报、上屏）</td></tr>
+    <tr><td class="k">摇杆</td><td>ADC</td><td class="num">−1000~1000</td><td>人手给的"想往哪走"</td><td><span class="tag t-slow">40 B</span></td><td>作为视觉左右差的侧化来源（brain:joy）</td></tr>
+    <tr><td class="k">BMI270</td><td>I²C 0x69</td><td class="num">±16 g 三轴</td><td>被碰（|a|−1）、左右倾（ax）</td><td><span class="tag t-fast">68 B</span></td><td>触觉组 + 反射通道的 lat</td></tr>
+    <tr><td class="k">ICS-43434</td><td>I²S 16 kHz</td><td class="num">≈ −90~0 dBFS</td><td>声音：拍手、说话、放歌</td><td><span class="tag t-fast">68 B</span></td><td>AUDIO / JO 组（听觉与 Johnston 器官共用频段）</td></tr>
+  </table>
+
+  <h3>视觉 / 嗅觉 / 触觉 / 听觉 —— 四条感官通道的接线</h3>
+  <table>
+    <tr><th>通道</th><th>输入</th><th>归一化</th><th>注入靶组的发放率</th><th>靶组神经元</th><th>当前实测</th></tr>
+    <tr><td class="k">视觉 visual</td><td>BH1750.lux</td><td>√(lux/2000)</td><td>0.9 Hz（≤180 Hz 满量程）</td><td class="num">465</td><td class="num">lux 5 → 0.9 Hz</td></tr>
+    <tr><td class="k">嗅觉 olfa</td><td>SGP40.VOC</td><td>VOC/1000</td><td>11.9 Hz</td><td class="num">106</td><td class="num">VOC 365 → 11.9 Hz</td></tr>
+    <tr><td class="k">温度 thermo</td><td>AHT10.T</td><td>线性映射</td><td>6.1 Hz</td><td class="num">29</td><td class="num">22.6 ℃ → 6.1 Hz</td></tr>
+    <tr><td class="k">湿度 hygro</td><td>AHT10.RH</td><td>线性映射</td><td>6.8 Hz</td><td class="num">74</td><td class="num">56.6 % → 6.8 Hz</td></tr>
+  </table>
+
+  <!-- ============================================================ 5. 转向 -->
+  <h2>五、方向是怎么定下来的（最容易被误解的一段）</h2>
+  <div class="flow">摇杆 joyX 或 IMU ax  ──►  左右配比 (1 ± visLat)  ──►  LC16 左/右 差动驱动
+                                                            │
+                                             6296 神经元积分 1 秒生物时间
+                                                            │
+                   DNa02(左−右) + 0.4 × DNa01(左−右)  ──►  减基线 → turn</div>
+  <p>
+    <b>关键点：turn 不是"读传感器直接算出来的"。</b>它读的是脑内两个方向神经元群（DNa01 / DNa02）的左右放电差。
+    传感器只负责改变"左边看到的光多还是右边多"，剩下的由连接组自己算。
+  </p>
+  <p>
+    实测极性：<b>右侧更亮 → DNa02(左−右) 为正 → 右转</b>。满舵对应 45 Hz 的左右差，死区 0.12，基线 250 ms 回正。
+    光照低于 15 lx 时视觉通道整体熄火，自动退回旧的 IMU 反射（<code>turn = −lat</code>），并在 <code>/api.steer.src</code> 里标明 <code>reflex-novis</code>。
+  </p>
+  <div class="warn">
+    <b>板子立起来就左转，是因为重力。</b>IMU 的 X 轴读到 0.6 g 以上的重力分量时，
+    会被当成"被从右边推了一下"，反射通道就给出满舵左转。<b>这不是 bug，是传感器没校准姿态</b>。
+    现在反射通道也加了 0.25 的死区，只要倾角不大就不会再打满舵。
+  </div>
+
+  <!-- ============================================================ 6. 闭环 -->
+  <h2>六、一拍 50 ms 的闭环里发生了什么</h2>
+  <table>
+    <tr><th>顺序</th><th>动作</th><th>耗时</th><th>说明</th></tr>
+    <tr><td class="num">1</td><td>板子读 IMU + 麦克风，打包 68 B</td><td class="num">≈ 3 ms</td><td>与上一帧严格间隔 50 ms</td></tr>
+    <tr><td class="num">2</td><td>UDP 上行到云端</td><td class="num">≈ 8~20 ms</td><td>手机热点 + 公网，实测抖动主要来源</td></tr>
+    <tr><td class="num">3</td><td>relay 校验并转发本机大脑</td><td class="num">&lt; 1 ms</td><td>magic / 长度 / CRC32 三重校验</td></tr>
+    <tr><td class="num">4</td><td>大脑走 500 步（25 ms 生物时间）</td><td class="num">≈ 23 ms</td><td>6296 神经元 × 稀疏突触，单核</td></tr>
+    <tr><td class="num">5</td><td>算 turn / flags，打包 32 B 下行</td><td class="num">&lt; 1 ms</td><td>turn 来自 DNa 左右差</td></tr>
+    <tr><td class="num">6</td><td>UDP 回板子，驱动屏幕精灵</td><td class="num">≈ 8~20 ms</td><td>板子用回声时间戳算真实 RTT</td></tr>
+    <tr><td class="k">合计</td><td class="k">感觉 → 动作</td><td class="num ok">≈ 40~65 ms</td><td>与真实果蝇的逃逸反射（≈ 40 ms）同一量级</td></tr>
+  </table>
+
+  <!-- ============================================================ 7. 边界 -->
+  <h2>七、现在这套体系"哪里是好的、哪里还是假的"</h2>
+  <p>坦白列出来，避免把演示效果当成能力：</p>
+  <table>
+    <tr><th>环节</th><th>状态</th><th>说明</th></tr>
+    <tr><td class="k">传感器采集</td><td class="ok">真实</td><td>7 个器件全部在线，有效位 <code>0x1F</code>，2 Hz 稳定上报</td></tr>
+    <tr><td class="k">传输链路</td><td class="ok">真实</td><td>20 Hz / 2 Hz 双车道，20 分钟无丢帧累积错误</td></tr>
+    <tr><td class="k">连接组积分</td><td class="ok">真实</td><td>FlyWire 真连接组子图，6296 神经元、38 组，非随机网络</td></tr>
+    <tr><td class="k">视觉通道</td><td class="no">近似</td><td>只有一个<b>总亮度</b>，没有左右视场。所谓"左亮右亮"是用摇杆或 IMU 假装出来的</td></tr>
+    <tr><td class="k">嗅觉 / 温湿</td><td class="ok">真实</td><td>VOC 与温湿度直接驱动对应靶组</td></tr>
+    <tr><td class="k">触觉</td><td class="no">单侧</td><td>v4 子回路里只有左侧链路能推出下行信号，右侧加到 900 Hz 仍全静 —— 要做"撞哪边躲另一边"得补全量连接组</td></tr>
+    <tr><td class="k">执行器</td><td class="no">开环</td><td>屏幕上的 2D 精灵，没有电机、没有动力学。它动起来<b>不会改变传感器读数</b>，所以还不是真正的闭环行为</td></tr>
+    <tr><td class="k">方向决策</td><td class="ok">真实</td><td>turn 确实来自 DNa02/DNa01 左右差，不是规则代码</td></tr>
+  </table>
+
+  <div class="card" style="margin-top:26px">
+    <div style="font-size:12.5px;color:#8595b5">
+      本页由 <code>brain_b/b_loop/arch.html</code> 提供，看板服务在 <code>/arch</code> 路径下返回它。
+      所有数值为 2026-11-12 真机实测，数据源 <code>/api</code>。
+      &nbsp;｜&nbsp; <a href="/">← 回到实时看板</a>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

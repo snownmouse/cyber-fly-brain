@@ -205,6 +205,7 @@ function featuresToIntensity(f) {
     jo: dbTo01(joDb),
     touch: clamp01((accelMag - CFG.touchRestG) / CFG.touchSpanG), // |a|=1g 静止 → 0
     lat: clamp(f.accel[0] / CFG.latSpanG, -1, 1),                 // 右正；静止 ax=0 → 0
+    accel: f.accel.slice(),                                       // 原始三轴 g，供 /api 诊断
   };
 }
 
@@ -283,6 +284,19 @@ let senseDirectOn = false;
 // 现在改成在主脑 stepFrame 里顺手读【全部 38 组】：反正 readRates 每帧都要
 // 清零一次，读 12 个端口和读 38 组的代价几乎一样（都是遍历 6296 个计数）。
 let lastAllRates = {};
+
+// ---- 波形历史（给看板的"心电图"用）------------------------------------------
+// 以前这套历史数组在 fly_watch2（诊断进程）里，诊断进程没起时看板拿不到，
+// 「听觉 / 侧向 / 梳理」三条曲线就永远是空的 —— 那正是"心电图没了"的原因。
+// 现在大脑自己按帧（20 Hz）记，240 点 = 12 秒，与看板标题一致，不再依赖外部进程。
+const HIST_MAX = 240;
+const HIST = { act: [], audio: [], esc: [], lat: [], jo: [], touch: [] };
+function histPush(k, v) {
+  if (!Number.isFinite(v)) return;
+  const a = HIST[k]; a.push(+v.toFixed(3));
+  if (a.length > HIST_MAX) a.shift();
+}
+function histReset() { for (const k of Object.keys(HIST)) HIST[k].length = 0; }
 
 // ---- 9 大功能区：把 38 个组按「感觉通道」聚合给看板用 ----------------------
 // wired=false 表示这条通道当前【根本没有传感器】，页面要显示「未接入」而不是 0 Hz。
@@ -731,7 +745,12 @@ function stepFrame(brain, arb, chState, ema, intensity, seq, tMs, opts) {
     if (Math.abs(turn) < STEER.deadband) turn = 0;
     steerSrc = vs.src === 'joy' ? 'brain:joy' : 'brain:imu';
   } else {
-    turn = clamp(-lat, -1, 1);                       // lat>0(右推) → 左转
+    // 反射通道也要过死区：板子静止但倾斜时，重力在 X 轴的分量会被当成侧向加速度，
+    // 实测 ax≈0.6 g 就让 turn 钉死在 −1（满舵打转）。死区外重新线性展开到满量程。
+    const a = Math.abs(lat);
+    const latD = a <= CFG.turnDeadband ? 0
+      : Math.sign(lat) * (a - CFG.turnDeadband) / (1 - CFG.turnDeadband);
+    turn = clamp(-latD, -1, 1);                      // lat>0(右推) → 左转
     steerSrc = STEER.mode === 'reflex' ? 'reflex' : 'reflex-novis';
   }
   const db = brainSteer ? STEER.deadband : CFG.turnDeadband;
@@ -770,6 +789,10 @@ function stepFrame(brain, arb, chState, ema, intensity, seq, tMs, opts) {
     steer: turn, dnaSteer: steerOf(ema),   // dnaSteer = DNa01 左右差（诊断用，不再参与决策）
     steerInfo: { src: steerSrc, visLat: +vs.lat.toFixed(3), visBase: +VIS.base.toFixed(1),
                  raw: +ema.steerRaw.toFixed(2), base: +steerBase.toFixed(2), turn: +turn.toFixed(3) },
+    // 诊断用：IMU 三轴原始 g 值与三路强度。板子静止倾斜时靠它区分"真侧推"和"重力分量"
+    intensity: { audio: +intensity.audio.toFixed(3), touch: +intensity.touch.toFixed(3),
+                 jo: +intensity.jo.toFixed(3), lat: +lat.toFixed(3),
+                 accel: (intensity.accel || []).map((v) => +v.toFixed(3)) },
     cmd: {
       seq, echo_ts_us: 0,
       turn,                                        // 由脑的 DNa 给出（见 3b 段），无视觉时退回反射
@@ -1003,7 +1026,7 @@ function startServer(data, argv) {
     };
   };
   // 只读 API 的状态（--api 关闭时全程为 null / 0，不产生任何开销）
-  let lastFrameForApi = null, lastCmdForApi = {}, lastBrainMsForApi = 0, lastSteerForApi = {};
+  let lastFrameForApi = null, lastCmdForApi = {}, lastBrainMsForApi = 0, lastSteerForApi = {}, lastIntensityForApi = {}, lastFeatureForApi = null;
 
   sock.on('message', (msg, rinfo) => {
     // 40 B 感官帧：只解码、只存，不步进大脑、不回下行帧。
@@ -1041,7 +1064,18 @@ function startServer(data, argv) {
     wasted += o.brainMs;
     // 给只读 API 的影子脑留一份最近特征（--api 开启时才需要）
     if (apiPort > 0) { lastFrameForApi = { features: f, seq: f.seq }; lastCmdForApi = o.cmd; lastBrainMsForApi = o.brainMs;
-      lastSteerForApi = o.steerInfo || {}; }
+      lastSteerForApi = o.steerInfo || {}; lastIntensityForApi = o.intensity || {};
+      // 68 B 上行帧的原始值（看板「上行特征」表直接读它，不再依赖诊断进程）
+      lastFeatureForApi = { seq: f.seq, rms_dbfs: f.rms_dbfs,
+                            low: f.band_low, mid: f.band_mid, high: f.band_high, accel: f.accel.slice() };
+      // 波形历史：act = 当场最大发放率；其余取归一化强度（0..1）
+      let mx = 0; for (const k in o.r) if (o.r[k] > mx) mx = o.r[k];
+      histPush('act', mx);
+      histPush('esc', o.ema ? o.ema.escape : 0);
+      const it = o.intensity || {};
+      histPush('audio', it.audio); histPush('lat', it.lat);
+      histPush('jo', it.jo); histPush('touch', it.touch);
+    }
     if (!quiet) {
       // 原有日志口径：未叠加感官的原始强度（感官只叠在 stepFrame 的入参上）
       const inten = featuresToIntensity(f);
@@ -1134,6 +1168,12 @@ function startServer(data, argv) {
                  GATE_SPAN: +(process.env.GATE_SPAN || 16),
                  MAPV: process.env.MAPV || 'v6' },
         sense: senseForApi(),
+        // 强度明细：三路音频/触觉/摇杆 + IMU 三轴 g。用来区分"真侧推"和"静止倾斜的重力分量"
+        intensity: lastIntensityForApi,
+        // 68 B 上行帧原始值（看板「上行特征」表用；以前靠 fly_watch2 诊断进程，它没起就全是 —）
+        feature: lastFeatureForApi,
+        // 波形历史（240 点 ≈ 12 s @20 Hz）：act 最大发放率、其余为 0..1 归一化强度
+        hist: HIST,
         // 转向：turn 从哪来（brain:joy / brain:imu / reflex / reflex-novis）+ 脑内左右差与基线
         steer: { ...lastSteerForApi, mode: STEER.mode, scale: STEER.scale,
                  visPort: VIS_PORT ? VIS_PORT.L.replace('_left', '') : null },
